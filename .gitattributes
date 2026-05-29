@@ -1,0 +1,4 @@
+# This is a Linux/nix project: shell scripts embedded in derivations break
+# with CRLF (bash reads a bare `\r` as a command -> exit 127). Force LF in
+# the working tree for all text files regardless of core.autocrlf / core.eol.
+* text=auto eol=lf

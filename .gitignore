@@ -1,0 +1,7 @@
+/target
+/result
+/result-*
+*.qcow2
+
+# Machine-local Claude Code settings — never share
+.claude/settings.local.json

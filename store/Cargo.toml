@@ -1,0 +1,15 @@
+[package]
+name = "store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "io-util"] }
+tempfile = "3"

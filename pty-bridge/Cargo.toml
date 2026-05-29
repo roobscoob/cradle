@@ -1,0 +1,11 @@
+[package]
+name = "pty-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pty-bridge"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

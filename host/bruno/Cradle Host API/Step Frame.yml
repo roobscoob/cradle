@@ -1,0 +1,23 @@
+info:
+  name: Step Frame
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: http://localhost:8080/frames/frm_01KSES39EFS234H625HJYP5Q6G/step
+  body:
+    type: json
+    data: |-
+      {
+        "binary": "sh",
+        "argv": ["-c", "echo 'Hi!' > /hi.txt"],
+        "cwd": "/"
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

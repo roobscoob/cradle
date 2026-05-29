@@ -1,0 +1,15 @@
+info:
+  name: Build Frame
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: http://localhost:8080/frames/build
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

@@ -1,0 +1,13 @@
+[workspace]
+members = ["agent", "agent-protocol", "cli", "host", "pty-bridge", "store"]
+# `agent` only builds on Linux (vsock + unix process APIs), so skip it for
+# default cargo commands run from the workspace root. Build it explicitly
+# via `cargo build -p agent` on Linux, or through `nix build .#agent`.
+# `host` is also Linux-only (KVM / firecracker), so skip it from defaults too.
+# `pty-bridge` is Linux-only too (openpty + unix process APIs); it runs
+# inside the guest, built static and baked into the image.
+# `cli` is cross-platform — Windows, macOS, Linux all welcome.
+# `store` is pure logic (CAS + page-tree), cross-platform, so it's in the
+# defaults — `cargo test` from the root exercises it on any OS.
+default-members = ["agent-protocol", "cli", "store"]
+resolver = "3"

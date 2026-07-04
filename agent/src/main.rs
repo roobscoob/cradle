@@ -103,14 +103,29 @@ async fn async_main() {
             Ok(stream) => {
                 info!("connected to host vsock (cid={HOST_CID} port={HOST_PORT})");
                 let started = Instant::now();
-                handle_session(stream).await;
+                let eval_completed = handle_session(stream).await;
                 info!("session ended; reconnecting");
-                // A connect-then-instant-fail session (born dead in a
-                // TRANSPORT_RESET window) must back off like a failed dial;
-                // redialing at full speed starves the guest kernel's vsock
-                // reset processing. A session that actually ran redials
-                // immediately — that's the fast post-restore reattach.
-                if started.elapsed() < MIN_SESSION_FOR_IMMEDIATE_REDIAL {
+                // Two reasons to park for one tick instead of redialing hot:
+                //
+                // - A connect-then-instant-fail session (born dead in a
+                //   TRANSPORT_RESET window) must back off like a failed
+                //   dial; redialing at full speed starves the guest
+                //   kernel's vsock reset processing.
+                //
+                // - A session that served a COMPLETED eval is over because
+                //   the host is about to pause + snapshot. Redialing now
+                //   would land in the dying listener's backlog and race the
+                //   freeze mid-handshake — the snapshot then captures torn
+                //   vsock state that costs the next restore ~200-350ms to
+                //   untangle (measured). Parked, the freeze captures a
+                //   sleeping task: nothing in flight, and the post-restore
+                //   wake dials the NEW listener within one tick (~15ms
+                //   attach). If no snapshot comes (cancelled op), waking
+                //   20ms later and dialing is exactly the old behavior.
+                //
+                // A session that ran but served no eval (a seed build's
+                // userspace-ready probe) redials immediately.
+                if eval_completed || started.elapsed() < MIN_SESSION_FOR_IMMEDIATE_REDIAL {
                     tokio::time::sleep(DIAL_RETRY).await;
                 }
             }
@@ -191,7 +206,10 @@ fn diag_kmsg(msg: &str) {
 // Per-session handler — spawned per accepted connection
 // ---------------------------------------------------------------------------
 
-async fn handle_session(stream: VsockStream) {
+/// Serve one host session. Returns whether an eval ran to completion in it
+/// — the caller uses that as the "snapshot imminent" signal (see the park
+/// logic in `async_main`).
+async fn handle_session(stream: VsockStream) -> bool {
     let (mut read_half, write_half) = tokio::io::split(stream);
 
     let (tx, mut rx) = mpsc::channel::<AgentMessage>(OUTBOUND_DEPTH);
@@ -199,7 +217,7 @@ async fn handle_session(stream: VsockStream) {
     // Hello first — confirms the byte path works (not "born dead"). Queued
     // ahead of any heartbeat, so it's the first thing the writer emits.
     if tx.send(AgentMessage::Hello).await.is_err() {
-        return;
+        return false;
     }
 
     // Writer owns `write_half` and serializes all writes, so a `write_all`
@@ -255,6 +273,7 @@ async fn handle_session(stream: VsockStream) {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
     let mut current_eval: Option<UnboundedSender<EvalControl>> = None;
+    let mut eval_completed = false;
     let mut decoder = HostMessageDecoder::new();
     let mut buf = vec![0u8; READ_BUF];
     let mut dead_rx = dead_rx;
@@ -264,6 +283,7 @@ async fn handle_session(stream: VsockStream) {
             biased;
             Some(()) = done_rx.recv() => {
                 current_eval = None;
+                eval_completed = true;
                 continue 'read;
             }
             // A write failed → the connection is dead (snapshot/restore).
@@ -305,6 +325,7 @@ async fn handle_session(stream: VsockStream) {
     heartbeat.abort();
     drop(tx);
     let _ = writer.await;
+    eval_completed
 }
 
 async fn dispatch_host_message(

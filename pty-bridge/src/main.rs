@@ -34,10 +34,7 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
 
 /// Upper bound on a single control-frame payload. The CLI never sends more
 /// than a few KiB (keystrokes, winsize), so anything huge means the framing
@@ -45,14 +42,15 @@ use std::time::{Duration, Instant};
 /// the allocator for ~4 GiB inside a 1 GiB guest and abort the bridge.
 const MAX_FRAME_LEN: usize = 1 << 20;
 
-/// How long after the direct child exits we keep draining PTY output that a
-/// backgrounded grandchild (still holding the slave) may be producing. The
-/// bridge's contract is "exit when the command exits"; this window just
-/// catches the command's own final buffered output.
-const POST_EXIT_DRAIN: Duration = Duration::from_millis(500);
-/// Poll granularity for the output pump. Doubles as the "quiet period" after
-/// child exit: one data-less poll interval past exit and we're done.
-const POLL_INTERVAL_MS: i32 = 50;
+/// Post-exit drain bound, in bytes — not time. Everything the command wrote
+/// before exiting is already queued in the PTY when `wait()` returns (tty
+/// writes complete into the buffer synchronously), and the kernel caps that
+/// queue (TTYB_DEFAULT_MEM_LIMIT, 64 KiB). Draining up to twice that after
+/// exit therefore provably covers the entire pre-exit backlog; anything past
+/// it was written *after* exit by a surviving descendant and is deliberately
+/// cut. Unlike a quiet-period timer, a byte bound adds zero latency to the
+/// normal step (the usual post-exit drain is one empty poll).
+const POST_EXIT_DRAIN_BYTES: usize = 128 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -151,58 +149,102 @@ fn main() {
     let master_r = master;
     let master_w = dup_or_exit(master);
 
-    // Output pump: PTY master → our stdout, verbatim. Ends when the master
-    // returns EOF/EIO (which Linux does once the LAST slave fd closes) — OR
-    // shortly after the direct child exits. The second condition is the one
-    // that matters when the command backgrounds something (`some-server &`):
-    // the grandchild inherits the slave and keeps it open, so the master
-    // never EOFs, and waiting for it would hang the bridge — and with it the
-    // whole step — forever. The agent kills anything left in the eval's
-    // cgroup once we exit, so nothing outlives the step either way.
-    let child_exited = Arc::new(AtomicBool::new(false));
-    let child_exited_r = Arc::clone(&child_exited);
+    // Self-pipe: the main thread signals "child exited" to the output pump
+    // by writing one byte, so the pump can poll it alongside the master —
+    // no timers, no polling intervals. Raw fds, deliberately never closed
+    // (the process exits right after the pump finishes, and keeping both
+    // ends open means the signalling write can never SIGPIPE).
+    let mut exit_pipe = [0i32; 2];
+    if unsafe { libc::pipe(exit_pipe.as_mut_ptr()) } != 0 {
+        eprintln!(
+            "pty-bridge: pipe failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(1);
+    }
+    let (exit_r, exit_w) = (exit_pipe[0], exit_pipe[1]);
+
+    // Output pump: PTY master → our stdout, verbatim. Two exact end
+    // conditions, in order of preference:
+    //
+    // - EOF/EIO on the master: every slave fd closed. This is the common
+    //   case even for `cmd &` — the command is a session leader with the
+    //   slave as its controlling terminal (setsid + TIOCSCTTY above), so
+    //   when it exits the kernel SIGHUPs the foreground process group, and
+    //   a non-interactive shell's backgrounded children are IN that group
+    //   (no job control → no setpgid). They die, the slave closes, EOF
+    //   arrives, and the drain is exact — the same mechanism that makes
+    //   `ssh -t host 'cmd &'` return promptly.
+    // - The exit pipe: `child.wait()` returned but something is still
+    //   holding the slave — a descendant that ignores SIGHUP or setsid'd
+    //   away without closing its fds. EOF will never come, so we drain the
+    //   already-queued backlog (bounded by POST_EXIT_DRAIN_BYTES, which the
+    //   kernel's PTY buffer cap guarantees is enough for everything written
+    //   pre-exit) and stop. The agent kills whatever is left in the eval's
+    //   cgroup once we exit, so nothing outlives the step either way.
     let reader = thread::spawn(move || {
         let mut master_file = unsafe { std::fs::File::from_raw_fd(master_r) };
         let mut stdout = std::io::stdout().lock();
         let mut buf = [0u8; 16 * 1024];
-        let mut drain_deadline: Option<Instant> = None;
+        let mut exited = false;
+        let mut drain_left = POST_EXIT_DRAIN_BYTES;
         loop {
-            if drain_deadline.is_none() && child_exited_r.load(Ordering::Relaxed) {
-                drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
-            }
-            if let Some(d) = drain_deadline {
-                if Instant::now() >= d {
-                    break;
-                }
-            }
-            let mut pfd = libc::pollfd {
-                fd: master_r,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, POLL_INTERVAL_MS) };
+            let mut pfds = [
+                libc::pollfd {
+                    fd: master_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: exit_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // Before the exit signal: block indefinitely on both fds. After
+            // it: zero-timeout polls of the master only — each iteration
+            // either drains queued bytes or proves the backlog is dry.
+            let (nfds, timeout) = if exited { (1, 0) } else { (2, -1) };
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, timeout) };
             if rc < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 break;
             }
-            if rc == 0 {
-                // Timed out with no data. Quiet after the child exited means
-                // its buffered output is drained — done.
-                if drain_deadline.is_some() {
-                    break;
-                }
-                continue;
-            }
-            match master_file.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() {
-                        break;
+            // Always service master data first — the exit signal is only
+            // acted on once the master has nothing readable, so the
+            // pre-exit backlog is never abandoned mid-drain.
+            if pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                match master_file.read(&mut buf) {
+                    // EOF/EIO: all slave fds closed — fully drained, exact.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush();
+                        if exited {
+                            drain_left = drain_left.saturating_sub(n);
+                            if drain_left == 0 {
+                                // Provably past the pre-exit backlog; the
+                                // rest is a live descendant's post-exit
+                                // output, which is out of contract.
+                                break;
+                            }
+                        }
+                        continue;
                     }
-                    let _ = stdout.flush();
                 }
+            }
+            if exited {
+                // Zero-timeout poll found the master dry: backlog drained.
+                break;
+            }
+            if pfds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let mut sig = [0u8; 8];
+                let _ = unsafe { libc::read(exit_r, sig.as_mut_ptr() as *mut _, sig.len()) };
+                exited = true;
             }
         }
     });
@@ -259,14 +301,15 @@ fn main() {
         }
     });
 
-    // Wait for the command, then give the output pump a bounded window to
-    // drain the last PTY bytes (joining the reader guarantees they reach
-    // stdout). Bounded, not until-EOF: a backgrounded grandchild can hold
-    // the slave open indefinitely, and the bridge's contract is to exit when
-    // the *command* exits. The input pump thread is left blocked on stdin;
-    // process exit reaps it.
+    // Wait for the command, then wake the output pump via the exit pipe; it
+    // drains exactly the pre-exit backlog and stops (joining it guarantees
+    // those bytes reach stdout). Not until-EOF: a SIGHUP-surviving
+    // descendant can hold the slave open forever, and the bridge's contract
+    // is to exit when the *command* exits. The input pump thread is left
+    // blocked on stdin; process exit reaps it.
     let _ = child.wait();
-    child_exited.store(true, Ordering::Relaxed);
+    let sig = 1u8;
+    let _ = unsafe { libc::write(exit_w, &sig as *const u8 as *const _, 1) };
     let _ = reader.join();
 }
 

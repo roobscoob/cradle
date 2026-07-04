@@ -583,18 +583,13 @@ async fn run_step_after_prepare(
     send_eval(&mut link, &eval).await?;
     let outcome = run_eval(&mut link, events, inputs).await?;
 
-    // Keep the agent link alive until AFTER the snapshot. Dropping it
-    // before the pause let the guest witness the EOF in the milliseconds
-    // before freezing — the snapshot then captured the agent mid-reconnect
-    // with the vsock driver mid-reset, and restoring that half-state cost
-    // ~200-350ms of guest-side untangling before the agent dialed out
-    // (measured; a calm in-session capture reattaches in ~15ms). With the
-    // link held through the pause, the frozen agent never sees the EOF:
-    // on the next restore its heartbeat write fails and it redials — the
-    // fast path, and the one this comment always promised.
+    // Drop the connection before snapshotting. The agent will detect the
+    // dead connection via its heartbeat write on the next restore and
+    // reconnect to the next step's listener.
+    drop(link);
+
     let _ = events.send(StepEvent::Phase("snapshotting")).await;
     let frame_id = snapshot_into_frame(vm, store, FrameInputs::Parent(parent)).await?;
-    drop(link);
 
     Ok((frame_id, outcome))
 }

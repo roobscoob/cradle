@@ -5,3 +5,5 @@
 
 # Machine-local Claude Code settings — never share
 .claude/settings.local.json
+# direnv (use flake)
+/.direnv

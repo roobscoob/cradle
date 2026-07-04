@@ -95,6 +95,28 @@
         }
       );
 
+      # Dev shell for the Mac: drives the remote dev loop (justfile → ssh to
+      # the x86 KVM box) and runs the cross-platform crates (cli, store)
+      # natively. No firecracker — darwin never runs the data plane.
+      darwinDev = flake-utils.lib.eachSystem [ "aarch64-darwin" ] (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          devShells.default = pkgs.mkShell {
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rust-analyzer
+              pkgs.just
+              pkgs.watchexec
+              pkgs.rsync
+            ];
+          };
+        }
+      );
+
       cradle = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
@@ -103,7 +125,7 @@
         ];
       };
     in
-    nixpkgs.lib.recursiveUpdate perSystem {
+    nixpkgs.lib.recursiveUpdate (nixpkgs.lib.recursiveUpdate perSystem darwinDev) {
       nixosConfigurations = {
         cradle = cradle;
         guest = guest;

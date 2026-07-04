@@ -425,7 +425,12 @@ impl ContentStore for DirStore {
                     out.write_all(&buf[..n])?;
                     done += n as u64;
                 }
-                out.into_inner().map_err(|e| e.into_error())?;
+                let out = out.into_inner().map_err(|e| e.into_error())?;
+                // Pay for our own writes: a fetched store_disk is ~1 GiB, and
+                // left buffered it throttles the next writer on the dest
+                // volume (measured: the first steps after a cold fetch paid
+                // seconds of balance_dirty_pages stalls for it).
+                out.sync_data()?;
                 Ok(len)
             })
             .await

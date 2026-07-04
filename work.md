@@ -403,6 +403,15 @@ ingest ~280 ms · commit (no fsync) ~200–350 ms · plumbing ~50 ms.
    pages from memory + child-image patch moved off the critical path behind
    a per-frame ready gate. Target: fc 40–80 ms, update 20–40 ms, walk ~10 ms
    → snapshotting ~120–190 ms.
+   **Measured (2026-07-04, steady state):** fc 218 · read+hash 67 ·
+   update 126 · commit 140 → **snapshotting ~556 ms**, step wall ~717 ms
+   (from ~1,500/~1,700 pre-phase-1). Misses vs target: fc has an ~200 ms
+   floor not explained by the output fs (O(image) bitmap/scan work inside
+   firecracker? — investigate, or let phase 3 shrink it); update's 126 ms is
+   per-node async walk overhead (boxed futures, level waves), compressible;
+   commit 140 ms ≈ walk + 13 MB buffered pack write, near floor sans fsync.
+   Also: cold-fetch artifact streaming now fsyncs (same write-back-debt
+   disease as the seed copy — first post-fetch steps paid fc=4.7 s/2.5 s).
 2. **(dissolved by the dev exemption — was: make the fsync cheap via SLOG.**
    sdo can still be split L2ARC/SLOG later as a NAS improvement; ~16–32 GB
    is the right SLOG size, not 2 TB.)

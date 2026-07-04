@@ -15,6 +15,7 @@ use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use client_protocol::{BuildResult, LogEvent, PhaseEvent};
 use crossterm::event::{
     Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -26,7 +27,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 mod app;
@@ -35,7 +35,7 @@ mod sse;
 mod tarball;
 mod ui;
 
-use app::{App, Entry, FooterLine, Mode, render_row};
+use app::{App, Entry, FooterLine, Mode, last_nonblank_row, render_row};
 use session::{Session, SessionEvent};
 use sse::{Event as SseEvent, post_sse};
 
@@ -43,6 +43,12 @@ use sse::{Event as SseEvent, post_sse};
 /// Generous so even a long line fits without wrapping inside the parser —
 /// ratatui handles visual wrap at render time.
 const BUILD_VT_COLS: u16 = 2048;
+/// Rows in that grid. A line longer than BUILD_VT_COLS wraps to the next
+/// grid row, and all non-blank rows are merged back into one logical line —
+/// so up to ROWS×COLS chars survive instead of everything past the first
+/// row being silently dropped. (Also ≥2 because vt100 0.16.2's `col_wrap`
+/// underflows on a 1-row grid.)
+const BUILD_VT_ROWS: u16 = 8;
 
 #[derive(Parser, Debug)]
 #[command(name = "cradle", about = "Interactive client for the cradle host")]
@@ -188,38 +194,24 @@ async fn run_build_phase(
                 let ev = item.context("SSE stream error during build")?;
                 match ev.name.as_str() {
                     "phase" => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                            if let Some(name) = v.get("name").and_then(|s| s.as_str()) {
-                                state.phase = Some(name.to_owned());
-                            }
+                        if let Ok(p) = serde_json::from_str::<PhaseEvent>(&ev.data) {
+                            state.phase = Some(p.name);
                         }
                     }
                     "log" => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                            if let Some(line) = v.get("line").and_then(|s| s.as_str()) {
-                                push_log(&mut state, line);
-                            }
+                        if let Ok(l) = serde_json::from_str::<LogEvent>(&ev.data) {
+                            push_log(&mut state, &l.line);
                         }
                     }
                     "ready" => {}
                     "result" => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                            let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-                            if !ok {
-                                let err = v
-                                    .get("error")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("?")
-                                    .to_owned();
-                                return Err(anyhow!("build failed: {err}"));
-                            }
-                            let frame_id = v
-                                .get("frame_id")
-                                .and_then(|s| s.as_str())
-                                .context("build result missing frame_id")?
-                                .to_owned();
-                            return Ok(frame_id);
+                        let r: BuildResult = serde_json::from_str(&ev.data)
+                            .context("parse build result event")?;
+                        if !r.ok {
+                            let err = r.error.unwrap_or_else(|| "?".into());
+                            return Err(anyhow!("build failed: {err}"));
                         }
+                        return r.frame_id.context("build result missing frame_id");
                     }
                     _ => {}
                 }
@@ -235,18 +227,24 @@ fn push_log(state: &mut BuildState, line: &str) {
     state.log_lines.push_back(parse_log_line(line));
 }
 
-/// Run a single log line through a 1-row vt100 parser so embedded ANSI
+/// Run a single log line through a small vt100 grid so embedded ANSI
 /// escape sequences (SGR colors, bold, italic, etc.) resolve into ratatui
 /// `Span` styles instead of being shown as literal escape text. Strips
-/// embedded `\r`/`\n` first since vt100 with rows=1 + no scrollback would
-/// otherwise lose any content following them.
+/// embedded `\r`/`\n` first since vt100 with no scrollback would otherwise
+/// lose any content following them. Long lines wrap across the grid's rows
+/// and are merged back into one logical `Line`.
 fn parse_log_line(line: &str) -> Line<'static> {
     let sanitized: String = line.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-    // 2 rows, not 1: vt100 0.16.2's `col_wrap` underflows on a 1-row grid
-    // when a long line exceeds BUILD_VT_COLS. We only read row 0 anyway.
-    let mut parser = vt100::Parser::new(2, BUILD_VT_COLS, 0);
+    let mut parser = vt100::Parser::new(BUILD_VT_ROWS, BUILD_VT_COLS, 0);
     parser.process(sanitized.as_bytes());
-    render_row(parser.screen(), 0, BUILD_VT_COLS)
+    let screen = parser.screen();
+    let mut spans = Vec::new();
+    if let Some(last) = last_nonblank_row(screen, BUILD_VT_ROWS, BUILD_VT_COLS) {
+        for row in 0..=last {
+            spans.extend(render_row(screen, row, BUILD_VT_COLS).spans);
+        }
+    }
+    Line::from(spans)
 }
 
 fn draw_build(f: &mut Frame, state: &mut BuildState) {
@@ -310,18 +308,20 @@ fn draw_build(f: &mut Frame, state: &mut BuildState) {
     }
 }
 
-/// Wrap-row cost of a styled `Line`, counted in visual cells. Walks every
-/// span's content rather than the line's literal byte length.
+/// Wrap-row cost of a styled `Line`, counted in visual cells. Uses the
+/// unicode display width (`Line::width`), not a char count — CJK and other
+/// wide characters occupy two cells, and undercounting them makes the
+/// bottom-anchored scroll hide the newest lines.
 fn wrap_rows_styled(line: &Line<'_>, width: u16) -> u16 {
     if width == 0 {
         return 1;
     }
-    let n: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let n = line.width();
     if n == 0 {
         return 1;
     }
     let w = width as usize;
-    ((n + w - 1) / w).min(u16::MAX as usize) as u16
+    n.div_ceil(w).min(u16::MAX as usize) as u16
 }
 
 /// Build a multipart form for the upload, or `None` if `--machine` wasn't
@@ -435,7 +435,14 @@ async fn run_repl(
                 }
             }
 
-            Some(cmd) = cmd_rx.recv() => {
+            // Guarded on Idle: a multi-line paste queues several commands
+            // before this branch runs. Dispatching a second command while
+            // one is Running would drop (kill) the in-flight session, strand
+            // its transcript entry on a spinner forever, and fork the second
+            // command from the wrong parent (`last_frame` is only set at
+            // finalize). Queued commands dispatch one-by-one as each step
+            // finalizes back to Idle.
+            Some(cmd) = cmd_rx.recv(), if matches!(app.mode, Mode::Idle) => {
                 let parent = app.last_frame.as_ref().unwrap_or(&app.session_image).clone();
                 app.start_step(cmd.clone(), term_cols, term_rows);
                 match session::open(host, &parent, &cmd, term_rows, term_cols) {
@@ -520,13 +527,13 @@ fn handle_key(app: &mut App, key: KeyEvent, term_rows: u16) -> EventAction {
     // and it keeps a way to scroll back while something interactive runs.)
     match key.code {
         KeyCode::PageUp => {
-            let step = term_rows.saturating_sub(1).max(1) / 2;
-            app.scroll = app.scroll.saturating_add(step.max(1));
+            let step = (term_rows.saturating_sub(1).max(1) / 2).max(1) as usize;
+            app.scroll = app.scroll.saturating_add(step);
             return EventAction::None;
         }
         KeyCode::PageDown => {
-            let step = term_rows.saturating_sub(1).max(1) / 2;
-            app.scroll = app.scroll.saturating_sub(step.max(1));
+            let step = (term_rows.saturating_sub(1).max(1) / 2).max(1) as usize;
+            app.scroll = app.scroll.saturating_sub(step);
             return EventAction::None;
         }
         _ => {}
@@ -576,28 +583,31 @@ fn handle_key(app: &mut App, key: KeyEvent, term_rows: u16) -> EventAction {
             app.scroll = 0;
             EventAction::SubmitCommand(cmd)
         }
+        // `app.cursor` is a BYTE offset (String::insert/remove take byte
+        // indices), so every move must land on a char boundary — advancing
+        // by 1 puts the cursor mid-char after any accented/CJK/emoji input
+        // and the next edit panics.
         KeyCode::Backspace => {
             if app.cursor > 0 {
-                app.cursor -= 1;
-                app.input.remove(app.cursor);
+                let prev = prev_char_boundary(&app.input, app.cursor);
+                app.input.remove(prev);
+                app.cursor = prev;
             }
             app.scroll = 0;
             EventAction::None
         }
         KeyCode::Char(c) => {
             app.input.insert(app.cursor, c);
-            app.cursor += 1;
+            app.cursor += c.len_utf8();
             app.scroll = 0;
             EventAction::None
         }
         KeyCode::Left => {
-            app.cursor = app.cursor.saturating_sub(1);
+            app.cursor = prev_char_boundary(&app.input, app.cursor);
             EventAction::None
         }
         KeyCode::Right => {
-            if app.cursor < app.input.len() {
-                app.cursor += 1;
-            }
+            app.cursor = next_char_boundary(&app.input, app.cursor);
             EventAction::None
         }
         KeyCode::Home => {
@@ -612,6 +622,18 @@ fn handle_key(app: &mut App, key: KeyEvent, term_rows: u16) -> EventAction {
     }
 }
 
+/// Byte offset of the char boundary immediately before `i` (0 if already at
+/// the start). `i` must itself be on a boundary — the cursor invariant.
+fn prev_char_boundary(s: &str, i: usize) -> usize {
+    s[..i].chars().next_back().map(|c| i - c.len_utf8()).unwrap_or(0)
+}
+
+/// Byte offset of the char boundary immediately after `i` (`s.len()` if
+/// already at the end).
+fn next_char_boundary(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(s.len())
+}
+
 /// Encode a key press into the bytes a terminal would send for it, for
 /// forwarding to the running command's PTY. Covers the common cases;
 /// returns `None` for keys we don't translate (they're simply not
@@ -620,8 +642,10 @@ fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char(c) => {
-            if ctrl {
+            if ctrl && c.is_ascii() {
                 // Map Ctrl-<char> to its C0 control byte: ^@=0 … ^_=31.
+                // ASCII only: `c as u8` truncates anything else to a bogus
+                // control byte (Ctrl+Ł would send ^A).
                 let upper = (c as u8).to_ascii_uppercase();
                 if (b'@'..=b'_').contains(&upper) {
                     Some(vec![upper - b'@'])

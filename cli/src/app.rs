@@ -14,15 +14,13 @@
 
 use std::time::{Duration, Instant};
 
-use base64::Engine;
+use client_protocol::{Exit, Outcome};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use serde_json::Value;
 
 use crate::session::{SessionEvent, StepResult};
-use crate::sse::Event;
 
 /// Per-parser scrollback rows — generous to preserve everything for the
 /// post-finalize `vt_to_lines` walk.
@@ -94,9 +92,15 @@ pub struct App {
     pub session_image: String,
     pub last_frame: Option<String>,
     pub input: String,
+    /// BYTE offset into `input` (always on a char boundary — see the cursor
+    /// handling in main.rs). Not a char count: `String::insert`/`remove`
+    /// take byte indices, and conflating the two panics on the first
+    /// multi-byte character.
     pub cursor: usize,
-    /// Rows scrolled away from the bottom. 0 means anchored to the live edge.
-    pub scroll: u16,
+    /// Rows scrolled away from the bottom. 0 means anchored to the live
+    /// edge. usize, not u16: a long session's transcript exceeds 65,535
+    /// rows well within normal use (~14 full-scrollback commands).
+    pub scroll: usize,
 }
 
 impl App {
@@ -141,60 +145,6 @@ impl App {
         self.scroll = 0;
     }
 
-    /// Drive the running entry from a single SSE event from the host's
-    /// `/frames/{id}/step` stream. Terminal events (`result`) flip mode back
-    /// to `Idle` after replacing the running entry with a finalized one.
-    pub fn handle_sse(&mut self, ev: Event) {
-        match ev.name.as_str() {
-            "phase" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    if let Some(name) = v.get("name").and_then(|s| s.as_str()) {
-                        if let Some(Entry::Running {
-                            current_phase,
-                            phase_log,
-                            ..
-                        }) = self.entries.last_mut()
-                        {
-                            let name = name.to_owned();
-                            *current_phase = Some(name.clone());
-                            phase_log.push((name, Instant::now()));
-                        }
-                    }
-                }
-            }
-            "stdout" | "stderr" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    if let Some(b64) = v.get("data").and_then(|s| s.as_str()) {
-                        if let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(b64)
-                        {
-                            if let Some(Entry::Running {
-                                vt,
-                                produced_output,
-                                ..
-                            }) = self.entries.last_mut()
-                            {
-                                vt.process(&bytes);
-                                *produced_output = true;
-                            }
-                        }
-                    }
-                }
-            }
-            "result" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    self.handle_result(&v);
-                }
-            }
-            // Unknown / forward-compat events are silently dropped — they're
-            // not meaningful to surface in a REPL.
-            _ => {}
-        }
-        // Any incoming event represents activity; snap the view back to the
-        // live edge so the user sees what's happening.
-        self.scroll = 0;
-    }
-
     /// Drive the running entry from a single [SessionEvent] produced by
     /// [crate::session]. Functionally the WebSocket equivalent of
     /// [Self::handle_sse]; the Result variant flips mode back to Idle by
@@ -235,12 +185,11 @@ impl App {
                 // the bridge intentionally doesn't propagate the command's
                 // exit code (we dropped exit-code fidelity when we moved
                 // off SSH). So in practice this is ~always Ok; the
-                // `outcome_to_footer` path stays for the rare spawn-failure
-                // case the host reports.
-                let footer = if outcome.is_null() {
-                    FooterLine::Ok { frame_id, duration }
-                } else {
-                    outcome_to_footer(&outcome, frame_id, duration)
+                // `outcome_to_footer` path stays for the rare spawn/wait
+                // failure cases the host reports.
+                let footer = match &outcome {
+                    None => FooterLine::Ok { frame_id, duration },
+                    Some(o) => outcome_to_footer(o, frame_id, duration),
                 };
                 self.finalize_running(footer);
             }
@@ -309,49 +258,6 @@ impl App {
         }
     }
 
-    /// Convenience for the renderer — the active running command's text, if
-    /// any. Used to paint the sticky top row during `Mode::Running`.
-    pub fn running_cmd(&self) -> Option<&str> {
-        match self.entries.last() {
-            Some(Entry::Running { cmd, .. }) => Some(cmd.as_str()),
-            _ => None,
-        }
-    }
-
-    fn handle_result(&mut self, v: &Value) {
-        let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-        if !ok {
-            let msg = v
-                .get("error")
-                .and_then(|s| s.as_str())
-                .unwrap_or("step failed")
-                .to_owned();
-            let footer = FooterLine::Error { message: msg };
-            self.finalize_running(footer);
-            return;
-        }
-        let frame_id = v
-            .get("frame_id")
-            .and_then(|s| s.as_str())
-            .map(String::from);
-        let duration = self.running_duration().unwrap_or_default();
-        let footer = if let Some(id) = frame_id.clone() {
-            self.last_frame = Some(id.clone());
-            match v.get("outcome") {
-                Some(out) => outcome_to_footer(out, id, duration),
-                None => FooterLine::Ok {
-                    frame_id: id,
-                    duration,
-                },
-            }
-        } else {
-            FooterLine::Error {
-                message: "step succeeded but host returned no frame_id".into(),
-            }
-        };
-        self.finalize_running(footer);
-    }
-
     fn running_duration(&self) -> Option<Duration> {
         match self.entries.last() {
             Some(Entry::Running { started, .. }) => Some(started.elapsed()),
@@ -397,35 +303,28 @@ fn phase_log_to_timings(log: Vec<(String, Instant)>) -> Vec<PhaseTiming> {
     out
 }
 
-fn outcome_to_footer(v: &Value, frame_id: String, duration: Duration) -> FooterLine {
-    if let Some(exited) = v.get("exited") {
-        if let Some(code) = exited.get("code").and_then(|n| n.as_i64()) {
-            return if code == 0 {
-                FooterLine::Ok { frame_id, duration }
-            } else {
-                FooterLine::Exit {
-                    frame_id,
-                    code,
-                    duration,
-                }
-            };
-        }
-        if let Some(sig) = exited.get("signal").and_then(|n| n.as_i64()) {
-            return FooterLine::Signal {
-                frame_id,
-                signal: sig,
-                duration,
-            };
-        }
-    }
-    if let Some(err) = v.get("spawn_failed").and_then(|s| s.as_str()) {
-        return FooterLine::Error {
+fn outcome_to_footer(o: &Outcome, frame_id: String, duration: Duration) -> FooterLine {
+    match o {
+        Outcome::Exited(Exit::Code(0)) => FooterLine::Ok { frame_id, duration },
+        Outcome::Exited(Exit::Code(code)) => FooterLine::Exit {
+            frame_id,
+            code: *code,
+            duration,
+        },
+        Outcome::Exited(Exit::Signal(signal)) => FooterLine::Signal {
+            frame_id,
+            signal: *signal,
+            duration,
+        },
+        Outcome::SpawnFailed(err) => FooterLine::Error {
             message: format!("spawn failed: {err}"),
-        };
+        },
+        // The command ran (the frame is real and is now `last_frame`) but
+        // its exit status was lost to a wait() error on the agent.
+        Outcome::WaitFailed(err) => FooterLine::Error {
+            message: format!("ran, but exit status unknown (wait failed: {err})"),
+        },
     }
-    // Fall through — host gave us a frame_id but we couldn't interpret the
-    // outcome shape. Treat as Ok rather than silently mislabeling failure.
-    FooterLine::Ok { frame_id, duration }
 }
 
 /// Walk the parser's full scrollback + visible screen, emitting one styled

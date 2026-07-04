@@ -25,9 +25,8 @@
 
 use anyhow::{Result, anyhow};
 use base64::Engine;
+use client_protocol::{EvalRequest, Outcome, StepControl};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -54,7 +53,10 @@ pub enum SessionEvent {
 
 #[derive(Debug)]
 pub enum StepResult {
-    Ok { frame_id: String, outcome: Value },
+    Ok {
+        frame_id: String,
+        outcome: Option<Outcome>,
+    },
     Err(String),
 }
 
@@ -97,13 +99,6 @@ fn frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
     f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     f.extend_from_slice(payload);
     f
-}
-
-#[derive(Serialize)]
-struct EvalRequest {
-    binary: String,
-    argv: Vec<String>,
-    cwd: String,
 }
 
 /// Open a fresh step session. Synchronous — allocates the channels and
@@ -202,12 +197,21 @@ async fn run_session(
                     Some(Ok(Message::Ping(p))) => {
                         let _ = ws_sink.send(Message::Pong(p)).await;
                     }
+                    // Clean close: the step is over (the host sends the
+                    // Result text frame before closing, so it's already
+                    // been forwarded above).
+                    Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
-                    // Close / error / stream-end: the step is over (the
-                    // host sends the Result text frame before closing, so
-                    // it's already been forwarded above).
-                    Some(Err(_)) | None => break,
-                    Some(Ok(Message::Close(_))) => break,
+                    // Transport error mid-step: surface it as the session's
+                    // Result instead of breaking silently — otherwise the
+                    // REPL can only synthesize a generic "session closed
+                    // without result" and the real cause is lost.
+                    Some(Err(e)) => {
+                        let _ = events_tx.send(SessionEvent::Result(StepResult::Err(
+                            format!("websocket error: {e}"),
+                        )));
+                        return;
+                    }
                 }
             }
             out = out_rx.recv() => {
@@ -236,31 +240,38 @@ fn http_to_ws(url: &str) -> Result<String> {
     }
 }
 
+/// Decode one host text frame. Shared typed shapes with the host via
+/// `client-protocol`; a frame that doesn't parse as any known control is
+/// ignored (forward-compat), but every *known* frame — including the
+/// pre-step `{"error": ...}` reply to a malformed EvalRequest — reaches the
+/// REPL instead of being silently dropped.
 fn parse_control(t: &str) -> Option<SessionEvent> {
-    let v: Value = serde_json::from_str(t).ok()?;
-    if let Some(name) = v.get("phase").and_then(Value::as_str) {
-        return Some(SessionEvent::Phase(name.to_owned()));
-    }
-    if let Some(b64) = v.get("stderr").and_then(Value::as_str) {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .ok()?;
-        return Some(SessionEvent::Stderr(bytes));
-    }
-    if let Some(r) = v.get("result") {
-        let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if ok {
-            let frame_id = r.get("frame_id")?.as_str()?.to_owned();
-            let outcome = r.get("outcome").cloned().unwrap_or(Value::Null);
-            return Some(SessionEvent::Result(StepResult::Ok { frame_id, outcome }));
-        } else {
-            let err = r
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_owned();
-            return Some(SessionEvent::Result(StepResult::Err(err)));
+    let control: StepControl = serde_json::from_str(t).ok()?;
+    Some(match control {
+        StepControl::Phase(name) => SessionEvent::Phase(name),
+        StepControl::Stderr(b64) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .ok()?;
+            SessionEvent::Stderr(bytes)
         }
-    }
-    None
+        StepControl::Error(e) => SessionEvent::Result(StepResult::Err(e)),
+        StepControl::Result(r) => {
+            if r.ok {
+                match r.frame_id {
+                    Some(frame_id) => SessionEvent::Result(StepResult::Ok {
+                        frame_id,
+                        outcome: r.outcome,
+                    }),
+                    None => SessionEvent::Result(StepResult::Err(
+                        "step succeeded but host returned no frame_id".into(),
+                    )),
+                }
+            } else {
+                SessionEvent::Result(StepResult::Err(
+                    r.error.unwrap_or_else(|| "unknown error".into()),
+                ))
+            }
+        }
+    })
 }

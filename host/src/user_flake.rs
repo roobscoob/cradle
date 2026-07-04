@@ -65,7 +65,7 @@ pub async fn build_user_artifacts(
         .into_owned();
     let agent_path = agent_static.to_string_lossy().into_owned();
     let bridge_path = pty_bridge_static.to_string_lossy().into_owned();
-    let flake_nix = wrapper_flake_source(&user_path, &agent_path, &bridge_path);
+    let flake_nix = wrapper_flake_source(&user_path, &agent_path, &bridge_path)?;
     tokio::fs::write(wrapper_dir.join("flake.nix"), flake_nix).await?;
     tokio::fs::write(wrapper_dir.join("base.nix"), BASE_MODULE).await?;
 
@@ -85,11 +85,57 @@ pub async fn build_user_artifacts(
     })
 }
 
+/// Escape a string for interpolation inside a double-quoted Nix string
+/// literal. Nix's escapes inside `"…"`: `\"`, `\\`, and `\${` (to suppress
+/// antiquotation). Without this, a `"` byte in an interpolated path — which
+/// is a legal Unix filename byte an uploaded tarball controls — closes the
+/// literal and the rest of the "path" evaluates as arbitrary Nix ON THE
+/// HOST. http.rs also renames uploads to a server-generated directory name
+/// before they reach here; this is the defense-in-depth layer.
+fn nix_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `specialArgs` paths are interpolated as BARE Nix path tokens (no
+/// quotes), so escaping can't help there — instead require the strict
+/// charset of a `/nix/store` output path. These come from the host's own
+/// `nix build`, so anything else indicates a bug, not user input.
+fn require_store_path(path: &str, what: &str) -> io::Result<()> {
+    let ok = path.starts_with("/nix/store/")
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '+' | '='));
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{what} is not a plain /nix/store path: {path:?}"
+        )))
+    }
+}
+
 /// Wrapper `flake.nix` text. Kept as a Rust format string so the dynamic
-/// fields (user path + agent path + pty-bridge path) stay obvious and
-/// shell-escape-free.
-fn wrapper_flake_source(user_path: &str, agent_path: &str, bridge_path: &str) -> String {
-    format!(
+/// fields (user path + agent path + pty-bridge path) stay obvious. The user
+/// path lands inside a `"…"` Nix string literal and is escaped accordingly;
+/// the two server paths land as bare path tokens and are charset-checked.
+fn wrapper_flake_source(user_path: &str, agent_path: &str, bridge_path: &str) -> io::Result<String> {
+    require_store_path(agent_path, "cradleAgent")?;
+    require_store_path(bridge_path, "cradlePtyBridge")?;
+    let user_path = nix_escape_string(user_path);
+    Ok(format!(
         r#"{{
   description = "cradle user-flake wrapper (synthesized per request)";
 
@@ -138,5 +184,5 @@ fn wrapper_flake_source(user_path: &str, agent_path: &str, bridge_path: &str) ->
     }};
 }}
 "#
-    )
+    ))
 }

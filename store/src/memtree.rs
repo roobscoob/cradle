@@ -252,6 +252,35 @@ where
     if items.is_empty() {
         return Ok(*parent);
     }
+    // Validate every dirty page against the parent's geometry up front. An
+    // out-of-range index would otherwise panic deep inside `rebuild` (inside
+    // the host's spawned capture task, past its VM cleanup), and a short
+    // non-final page would silently shift every byte after it at `assemble`
+    // time — the tree has no per-leaf lengths, so `assemble` just concatenates.
+    let pages = page_count(parent.len);
+    if pages == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dirty pages supplied for a zero-length parent image",
+        ));
+    }
+    let last_page_len = (parent.len - (pages - 1) * PAGE as u64) as usize;
+    for (page, bytes) in &items {
+        if *page >= pages {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dirty page {page} out of range (parent has {pages} pages)"),
+            ));
+        }
+        let expected = if *page == pages - 1 { last_page_len } else { PAGE };
+        let got = bytes.as_ref().len();
+        if got != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dirty page {page} is {got} bytes, expected {expected}"),
+            ));
+        }
+    }
     // Put dirty pages in bounded concurrent waves (same as `build`), pairing
     // each hash back to its page index. Awaiting one put per page is
     // threadpool-latency-bound (~one fs round-trip per page); waves of
@@ -302,8 +331,18 @@ fn rebuild<'a, C: Cas>(
         let mut children = decode_node(&cas.get(&node).await?)?;
         if level == 1 {
             // Children are leaves: drop in the replacement hashes directly.
+            // Checked indexing: `update` validated page ranges against
+            // `parent.len`, but a stored node inconsistent with that length
+            // (truncated/corrupt) must surface as an error, not a panic.
             for &(page, leaf) in dirty {
-                children[(page - page_base) as usize] = leaf;
+                let idx = (page - page_base) as usize;
+                let slot = children.get_mut(idx).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("node at page_base {page_base} has no child {idx} for page {page}"),
+                    )
+                })?;
+                *slot = leaf;
             }
         } else {
             // Partition the (sorted) dirty slice by child subtree and recurse
@@ -668,6 +707,50 @@ mod tests {
         // 10 pages fit one level-1 node (fanout 64), so height is 1 and that
         // node is the root. Distinct writes: 1 leaf + 1 root node = 2.
         assert_eq!(cas.writes(), 2, "identical pages must dedup to one leaf");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_out_of_range_page() {
+        let cas = MemCas::default();
+        let data = pseudo(7, 4 * PAGE);
+        let tree = build(&cas, &data).await.unwrap();
+        // Page 4 is one past the end of a 4-page image.
+        let err = update(&cas, &tree, [(4u64, vec![0u8; PAGE])])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_short_non_final_page() {
+        let cas = MemCas::default();
+        let data = pseudo(9, 4 * PAGE);
+        let tree = build(&cas, &data).await.unwrap();
+        // A short page anywhere but the final slot would shift every byte
+        // after it at assemble time — must be rejected, not stored.
+        let err = update(&cas, &tree, [(1u64, vec![0u8; 100])])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_wrong_final_page_len() {
+        let cas = MemCas::default();
+        // Image with a short final page (123 bytes): updates to that page must
+        // be exactly 123 bytes — a full-PAGE replacement would grow the image
+        // without updating len.
+        let data = pseudo(11, 2 * PAGE + 123);
+        let tree = build(&cas, &data).await.unwrap();
+        let err = update(&cas, &tree, [(2u64, vec![0u8; PAGE])])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // The exact final-page length is accepted.
+        let ok = update(&cas, &tree, [(2u64, vec![0u8; 123])]).await.unwrap();
+        let out = assemble_vec(&cas, &ok).await;
+        assert_eq!(out.len(), data.len());
+        assert_eq!(&out[2 * PAGE..], &vec![0u8; 123][..]);
     }
 
     #[tokio::test]

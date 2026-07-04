@@ -3,7 +3,9 @@ mod console_log;
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_protocol::{AgentMessage, ExitResult, HostMessage, HostMessageDecoder, Stream};
 use log::{error, info, warn};
@@ -15,11 +17,12 @@ use tokio_vsock::{VsockAddr, VsockStream};
 
 /// Well-known vsock CID of the host. The agent dials *out* to the host
 /// (the host is the listener now) — see the lifecycle comment on
-/// `AgentMessage` in agent-protocol.
-const HOST_CID: u32 = 2;
+/// `AgentMessage` in agent-protocol. Values are defined once in
+/// agent-protocol so host and agent can't drift.
+const HOST_CID: u32 = agent_protocol::VSOCK_HOST_CID;
 /// Port the host listens on (host-side it's a UDS at `<uds>_<port>`; the
 /// guest connects to (HOST_CID, HOST_PORT) and firecracker forwards).
-const HOST_PORT: u32 = 1024;
+const HOST_PORT: u32 = agent_protocol::VSOCK_HOST_PORT;
 /// How often the agent writes a `Heartbeat` on the connection. A failed
 /// heartbeat write is how the agent detects that a snapshot/restore killed
 /// the connection — reads don't wake on the guest kernel's TRANSPORT_RESET,
@@ -41,6 +44,16 @@ const READ_BUF: usize = 8 * 1024;
 /// Outbound channel depth. Bounded so per-eval forwarders backpressure into
 /// the child's pipe when the host stalls reading the socket.
 const OUTBOUND_DEPTH: usize = 32;
+/// Cap on stdin bytes buffered toward a child that isn't reading them. The
+/// buffer sits behind unbounded channels (so Kill stays responsive even when
+/// the child's stdin pipe is full); without a byte cap, a host streaming
+/// stdin at a non-reader would grow agent memory until the guest OOMs and
+/// the microVM dies mid-step. Past the cap, stdin is dropped with a log.
+const STDIN_BUF_CAP: usize = 8 * 1024 * 1024;
+/// A session that ends faster than this was born dead (connected during the
+/// post-restore TRANSPORT_RESET window and failed on the first write) — back
+/// off before redialing instead of hammering the resetting vsock device.
+const MIN_SESSION_FOR_IMMEDIATE_REDIAL: Duration = Duration::from_millis(100);
 
 /// In-process messages sent from the per-session read loop to the running
 /// `handle_eval` task. Stays out of the wire protocol.
@@ -89,8 +102,17 @@ async fn async_main() {
         match VsockStream::connect(VsockAddr::new(HOST_CID, HOST_PORT)).await {
             Ok(stream) => {
                 info!("connected to host vsock (cid={HOST_CID} port={HOST_PORT})");
+                let started = Instant::now();
                 handle_session(stream).await;
                 info!("session ended; reconnecting");
+                // A connect-then-instant-fail session (born dead in a
+                // TRANSPORT_RESET window) must back off like a failed dial;
+                // redialing at full speed starves the guest kernel's vsock
+                // reset processing. A session that actually ran redials
+                // immediately — that's the fast post-restore reattach.
+                if started.elapsed() < MIN_SESSION_FOR_IMMEDIATE_REDIAL {
+                    tokio::time::sleep(DIAL_RETRY).await;
+                }
             }
             Err(e) => {
                 // Dial failed (host listener not up yet, or a born-dead
@@ -388,9 +410,14 @@ async fn handle_eval(
 
     // Stdin pipe lives in a tiny task so a slow stdin write can't stall the
     // control loop (Kill must stay responsive even if the child has stopped
-    // reading stdin). Dropping the sender EOFs the child's stdin.
+    // reading stdin). Dropping the sender EOFs the child's stdin. The channel
+    // stays unbounded (an awaited send here would block Kill — the reason it
+    // exists), so the memory bound is enforced separately: `stdin_buffered`
+    // tracks bytes queued but not yet written, and past STDIN_BUF_CAP new
+    // stdin is dropped instead of OOMing the guest.
     let (stdin_writer_tx, stdin_writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let stdin_task = tokio::spawn(write_stdin(stdin, stdin_writer_rx));
+    let stdin_buffered = Arc::new(AtomicUsize::new(0));
+    let stdin_task = tokio::spawn(write_stdin(stdin, stdin_writer_rx, Arc::clone(&stdin_buffered)));
     let mut stdin_writer_tx: Option<UnboundedSender<Vec<u8>>> = Some(stdin_writer_tx);
 
     let wait_fut = child.wait();
@@ -402,7 +429,17 @@ async fn handle_eval(
             ctrl = ctrl_rx.recv(), if ctrl_open => match ctrl {
                 Some(EvalControl::Stdin(data)) => {
                     if let Some(t) = stdin_writer_tx.as_ref() {
-                        let _ = t.send(data);
+                        let queued = stdin_buffered.load(Ordering::Relaxed);
+                        if queued + data.len() > STDIN_BUF_CAP {
+                            warn!(
+                                "stdin buffer over {STDIN_BUF_CAP} bytes (child not \
+                                 reading); dropping {} bytes",
+                                data.len()
+                            );
+                        } else {
+                            stdin_buffered.fetch_add(data.len(), Ordering::Relaxed);
+                            let _ = t.send(data);
+                        }
                     }
                 }
                 Some(EvalControl::StdinClose) => {
@@ -433,6 +470,13 @@ async fn handle_eval(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
+    // Wait for the killed tree to actually drain, then rmdir — BEFORE
+    // ProcessExit goes out (which is what lets the host snapshot). An
+    // immediate rmdir raced slow-exiting descendants into EBUSY, and the
+    // leaked eval-N dir was captured into the frame and inherited by every
+    // fork down the lineage.
+    cg.destroy().await;
+
     // Signal the session loop BEFORE putting ProcessExit on the wire.
     let _ = done_tx.send(());
 
@@ -445,14 +489,24 @@ async fn handle_eval(
             };
             AgentMessage::ProcessExit(result)
         }
-        Err(err) => AgentMessage::ProcessErr(err),
+        // wait() errored AFTER the child ran — distinct from ProcessErr
+        // (spawn-time failure): the frame may have been mutated, and the
+        // host must not report "spawn failed" for a command that executed.
+        Err(err) => AgentMessage::ProcessWaitErr(err),
     };
     let _ = tx.send(final_msg).await;
 }
 
-async fn write_stdin(mut stdin: ChildStdin, mut rx: UnboundedReceiver<Vec<u8>>) {
+async fn write_stdin(
+    mut stdin: ChildStdin,
+    mut rx: UnboundedReceiver<Vec<u8>>,
+    buffered: Arc<AtomicUsize>,
+) {
     while let Some(data) = rx.recv().await {
-        if stdin.write_all(&data).await.is_err() {
+        let n = data.len();
+        let ok = stdin.write_all(&data).await.is_ok();
+        buffered.fetch_sub(n, Ordering::Relaxed);
+        if !ok {
             return;
         }
     }

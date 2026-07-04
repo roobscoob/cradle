@@ -53,8 +53,12 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
         header_rows,
     } = build_transcript(app, area.width, area.height);
 
-    let total = lines.len() as u16;
-    let visible = area.height;
+    // All scroll math in usize: a long session's transcript exceeds
+    // u16::MAX rows within normal use, and truncating collapses the view to
+    // the top. We window the line list ourselves (skip/take) instead of
+    // using Paragraph::scroll, whose offset is u16.
+    let total = lines.len();
+    let visible = area.height as usize;
     // Bottom-anchored: scroll_y is the number of lines hidden above the
     // visible window. user `app.scroll` lifts the window further off the
     // bottom (capped at total). Write the clamped value back so scrolling
@@ -63,9 +67,10 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     let max_scroll_y = total.saturating_sub(visible);
     app.scroll = app.scroll.min(max_scroll_y);
     let user_scroll = app.scroll;
-    let scroll_y = max_scroll_y.saturating_sub(user_scroll);
+    let scroll_y = max_scroll_y - user_scroll;
 
-    let para = Paragraph::new(lines).scroll((scroll_y, 0));
+    let window: Vec<Line<'static>> = lines.into_iter().skip(scroll_y).take(visible).collect();
+    let para = Paragraph::new(window);
     f.render_widget(para, area);
 
     // CSS-sticky overlay. The topmost visible logical row is `scroll_y`.
@@ -74,7 +79,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     // `position: sticky; top: 0` for a section header in a scrolling list.
     // When the body of E fully scrolls past, owners[scroll_y] no longer
     // points to E, and the overlay automatically releases.
-    if let Some(Some(owner)) = owners.get(scroll_y as usize).copied() {
+    if let Some(Some(owner)) = owners.get(scroll_y).copied() {
         if header_rows[owner] < scroll_y {
             let top = Rect {
                 x: area.x,
@@ -94,14 +99,14 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     // Cursor on the active prompt — only if Idle AND the user hasn't scrolled
     // away (otherwise the cursor would land off-screen).
     if matches!(app.mode, Mode::Idle) && user_scroll == 0 && total > 0 {
-        let last_logical_row = total - 1;
-        let on_screen_row = last_logical_row.saturating_sub(scroll_y);
-        if on_screen_row < visible {
-            let col = 2 + app.cursor as u16; // "$ " prefix
-            let x = area.x + col.min(area.width.saturating_sub(1));
-            let y = area.y + on_screen_row;
-            f.set_cursor_position((x, y));
-        }
+        let on_screen_row = (total - 1 - scroll_y).min(visible.saturating_sub(1)) as u16;
+        // Display column, not byte offset: `app.cursor` indexes bytes, and
+        // multi-byte chars would otherwise push the cursor past the text.
+        let cursor_chars = app.input[..app.cursor].chars().count();
+        let col = 2 + cursor_chars.min(u16::MAX as usize) as u16; // "$ " prefix
+        let x = area.x + col.min(area.width.saturating_sub(1));
+        let y = area.y + on_screen_row;
+        f.set_cursor_position((x, y));
     }
 }
 
@@ -109,14 +114,14 @@ struct Transcript {
     lines: Vec<Line<'static>>,
     owners: Vec<Option<usize>>,
     headers: Vec<Line<'static>>,
-    header_rows: Vec<u16>,
+    header_rows: Vec<usize>,
 }
 
 fn build_transcript(app: &mut App, cols: u16, area_height: u16) -> Transcript {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut owners: Vec<Option<usize>> = Vec::new();
     let mut headers: Vec<Line<'static>> = Vec::new();
-    let mut header_rows: Vec<u16> = Vec::new();
+    let mut header_rows: Vec<usize> = Vec::new();
 
     let entries_len = app.entries.len();
     for (i, entry) in app.entries.iter_mut().enumerate() {
@@ -192,7 +197,7 @@ fn build_transcript(app: &mut App, cols: u16, area_height: u16) -> Transcript {
         };
 
         let header = header_line(cmd);
-        header_rows.push(lines.len() as u16);
+        header_rows.push(lines.len());
         headers.push(header.clone());
         lines.push(header);
         owners.push(Some(i));

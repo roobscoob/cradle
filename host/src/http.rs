@@ -20,7 +20,7 @@ use std::{convert::Infallible, io, path::PathBuf, sync::Arc};
 use axum::{
     Json, Router,
     extract::{
-        FromRequestParts, Multipart, Path, State,
+        DefaultBodyLimit, FromRequestParts, Multipart, Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{StatusCode, request::Parts},
@@ -28,11 +28,14 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine;
+use client_protocol::{
+    BuildResult, DataEvent, Exit, LogEvent, Outcome, PhaseEvent, StepControl, StepResult,
+};
 use fctools::vmm::installation::VmmInstallation;
 use flate2::read::GzDecoder;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde::Serialize;
-use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -58,7 +61,16 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/frames", get(list_frames))
-        .route("/frames/build", post(build_handler))
+        .route(
+            "/frames/build",
+            // axum's default body limit is 2 MB, which would reject any real
+            // flake upload long before our own MAX_UPLOAD_BYTES check runs.
+            // Small slack on top of the cap so multipart framing overhead
+            // doesn't shave bytes off a maximum-size tarball; the per-field
+            // check below enforces the real limit.
+            post(build_handler)
+                .layer(DefaultBodyLimit::max((MAX_UPLOAD_BYTES + 64 * 1024) as usize)),
+        )
         .route(
             "/frames/{id}/step",
             post(step_handler_sse).get(step_handler_ws),
@@ -99,6 +111,10 @@ async fn build_handler(
 
     let (event_tx, mut event_rx) = mpsc::channel::<BuildEvent>(64);
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    // Fires when the client drops the SSE connection, so `build_frame` can
+    // kill the nix build / VM instead of running detached to completion and
+    // finalizing a ~1 GiB frame nobody can reference.
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
     let installation = Arc::clone(&state.installation);
     let frames = Arc::clone(&state.frames);
@@ -114,19 +130,41 @@ async fn build_handler(
             artifacts,
             user_flake_dir,
             event_tx,
+            cancel_rx,
         ));
+        let mut cancel_tx = Some(cancel_tx);
         while let Some(ev) = event_rx.recv().await {
             if sse_tx.send(Ok(build_event_to_sse(ev))).await.is_err() {
-                return;
+                if let Some(tx) = cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+                break;
             }
         }
+        // Close the event channel BEFORE awaiting the task: once we stop
+        // draining it, any in-flight `events.send` inside build_frame must
+        // fail fast rather than block on a full channel forever (which would
+        // wedge the task with its VM alive).
+        drop(event_rx);
         let result = build_task.await;
-        let ev = match result {
-            Ok(Ok(id)) => result_event(json!({"ok": true, "frame_id": id.as_str()})),
-            Ok(Err(e)) => result_event(json!({"ok": false, "error": e.to_string()})),
-            Err(e) => result_event(json!({"ok": false, "error": format!("panic: {e}")})),
+        let body = match result {
+            Ok(Ok(id)) => BuildResult {
+                ok: true,
+                frame_id: Some(id.as_str().to_owned()),
+                error: None,
+            },
+            Ok(Err(e)) => BuildResult {
+                ok: false,
+                frame_id: None,
+                error: Some(e.to_string()),
+            },
+            Err(e) => BuildResult {
+                ok: false,
+                frame_id: None,
+                error: Some(format!("panic: {e}")),
+            },
         };
-        let _ = sse_tx.send(Ok(ev)).await;
+        let _ = sse_tx.send(Ok(result_event(&body))).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()))
@@ -164,12 +202,11 @@ async fn extract_user_flake(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")))?;
 
-        // Stream the bytes to a tempfile in the upload dir, capped at MAX_UPLOAD_BYTES.
+        // Stream the bytes to a tempfile in the upload dir, capped at
+        // MAX_UPLOAD_BYTES — chunk by chunk, so N concurrent uploads never
+        // pin N full tarballs in heap.
         let tarball_path = upload_dir.join("flake.tgz");
-        let bytes = collect_field_bytes(field, MAX_UPLOAD_BYTES).await?;
-        tokio::fs::write(&tarball_path, &bytes)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write tarball: {e}")))?;
+        stream_field_to_file(field, &tarball_path, MAX_UPLOAD_BYTES).await?;
 
         // Extract synchronously with a running byte cap. tar+flate2 are not
         // async, but extracting a 50 MB tarball is fast enough to do
@@ -197,32 +234,53 @@ async fn extract_user_flake(
             )
         })?;
 
-        return Ok(Some(root));
+        // SECURITY: move the flake root to a server-generated name before it
+        // goes anywhere near nix. `root` may be the tarball's own top-level
+        // directory name — attacker-chosen bytes (quotes are legal in Unix
+        // filenames) that user_flake.rs interpolates into a synthesized
+        // flake.nix. After this rename, every component of the path the
+        // wrapper flake sees was produced by this server.
+        let src = upload_dir.join("src");
+        tokio::fs::rename(&root, &src).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("normalize upload dir: {e}"),
+            )
+        })?;
+
+        return Ok(Some(src));
     }
     Ok(None)
 }
 
-/// Collect a multipart field's bytes into a `Vec<u8>`, rejecting if it grows
-/// past `max_bytes`.
-async fn collect_field_bytes(
+/// Stream a multipart field to `dest`, rejecting once it grows past
+/// `max_bytes`. Never buffers more than one chunk in memory.
+async fn stream_field_to_file(
     mut field: axum::extract::multipart::Field<'_>,
+    dest: &std::path::Path,
     max_bytes: u64,
-) -> Result<Vec<u8>, (StatusCode, String)> {
-    let mut acc: Vec<u8> = Vec::new();
+) -> Result<(), (StatusCode, String)> {
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("create tarball: {e}")))?;
+    let mut written: u64 = 0;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart chunk: {e}")))?
     {
-        if (acc.len() as u64) + (chunk.len() as u64) > max_bytes {
+        written += chunk.len() as u64;
+        if written > max_bytes {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("upload exceeds {max_bytes} bytes"),
             ));
         }
-        acc.extend_from_slice(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write tarball: {e}")))?;
     }
-    Ok(acc)
+    Ok(())
 }
 
 /// Find the directory that contains `flake.nix`. Accepts both flat tarballs
@@ -270,6 +328,12 @@ impl<R: io::Read> CappedReader<R> {
 impl<R: io::Read> io::Read for CappedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
+            // Only error if there really is MORE data — a payload of exactly
+            // the cap is legal, and tar probes for EOF past the last entry.
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "decompressed size cap exceeded",
@@ -327,19 +391,20 @@ async fn step_handler_sse(
                 break;
             }
         }
+        // Close the event channel BEFORE awaiting the task. Once we stop
+        // draining, any in-flight `events.send` inside step_frame must fail
+        // fast instead of blocking on a full channel — otherwise a cancelled
+        // step could wedge forever with its VM alive.
+        drop(event_rx);
         // Wait for `step_frame` to finish (clean tear-down via hard_kill)
         // whether we cancelled it or it completed naturally.
         let result = step_task.await;
-        let ev = match result {
-            Ok(Ok((id, outcome))) => result_event(json!({
-                "ok": true,
-                "frame_id": id.as_str(),
-                "outcome": outcome_to_json(&outcome),
-            })),
-            Ok(Err(e)) => result_event(json!({"ok": false, "error": e.to_string()})),
-            Err(e) => result_event(json!({"ok": false, "error": format!("panic: {e}")})),
+        let body = match result {
+            Ok(Ok((id, outcome))) => step_result_ok(&id, &outcome),
+            Ok(Err(e)) => step_result_err(e.to_string()),
+            Err(e) => step_result_err(format!("panic: {e}")),
         };
-        let _ = sse_tx.send(Ok(ev)).await;
+        let _ = sse_tx.send(Ok(result_event(&body))).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()))
@@ -442,11 +507,9 @@ async fn run_step_ws_session(
             Ok(e) => e,
             Err(e) => {
                 let _ = ws_sink
-                    .send(Message::Text(
-                        json!({"error": format!("invalid EvalRequest: {e}")})
-                            .to_string()
-                            .into(),
-                    ))
+                    .send(control_frame(&StepControl::Error(format!(
+                        "invalid EvalRequest: {e}"
+                    ))))
                     .await;
                 return;
             }
@@ -473,73 +536,112 @@ async fn run_step_ws_session(
 
     let mut cancel_tx = Some(cancel_tx);
 
-    // Multiplex between:
-    //   (a) outbound step events → ws_sink,
-    //   (b) inbound ws frames → input_tx (or cancel),
-    // until either side terminates. Whichever side dies first triggers
-    // cancel + drain.
-    loop {
-        tokio::select! {
-            biased;
-            ev = event_rx.recv() => {
-                let Some(ev) = ev else { break; };
-                if send_step_event(&mut ws_sink, ev).await.is_err() {
-                    if let Some(tx) = cancel_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    break;
-                }
-            }
-            frame = ws_stream.next() => {
-                match frame {
-                    Some(Ok(Message::Binary(b))) => {
-                        if input_tx.send(StepInput::Stdin(b.to_vec())).await.is_err() {
+    // The two directions run as SEPARATE tasks. A single mux loop had two
+    // failure modes this structure removes by construction:
+    //
+    // - circular backpressure deadlock: the loop blocked in `input_tx.send`
+    //   (full) while run_eval blocked in `events.send` (full) — neither side
+    //   drained the other, wedging the session and its VM forever;
+    // - starvation: `biased` polling of `event_rx` first meant a guest
+    //   flooding stdout kept that branch permanently ready, so the inbound
+    //   frame carrying `{"kill":true}` was never read — the one affordance
+    //   for stopping a runaway command didn't work under exactly the load
+    //   that makes it necessary.
+    //
+    // Outbound: step events → ws_sink (plus pongs for the pings the inbound
+    // task forwards). Owns the sink; returns it for the final result frame.
+    let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(4);
+    let outbound = tokio::spawn(async move {
+        let mut pong_open = true;
+        loop {
+            tokio::select! {
+                ev = event_rx.recv() => match ev {
+                    Some(ev) => {
+                        if send_step_event(&mut ws_sink, ev).await.is_err() {
+                            // Client unreachable — stop draining; dropping
+                            // event_rx (below, on return) makes step_frame's
+                            // sends fail fast, and the inbound task sees the
+                            // dead connection on its next read and cancels.
                             break;
                         }
                     }
-                    Some(Ok(Message::Text(t))) => {
-                        let v: serde_json::Value =
-                            serde_json::from_str(t.as_str()).unwrap_or(json!({}));
-                        if v.get("kill").and_then(|b| b.as_bool()) == Some(true) {
-                            let _ = input_tx.send(StepInput::Kill).await;
-                        } else if v.get("stdin_close").and_then(|b| b.as_bool()) == Some(true) {
-                            let _ = input_tx.send(StepInput::StdinClose).await;
-                        }
-                        // Other text frames are ignored as forward-compat.
+                    None => break, // step finished; result is sent by the caller
+                },
+                p = pong_rx.recv(), if pong_open => match p {
+                    Some(p) => {
+                        let _ = ws_sink.send(Message::Pong(p.into())).await;
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws_sink.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        if let Some(tx) = cancel_tx.take() {
-                            let _ = tx.send(());
-                        }
-                        break;
-                    }
+                    None => pong_open = false,
+                },
+            }
+        }
+        ws_sink
+    });
+
+    // Inbound: client frames → input_tx. Never blocks behind an outbound
+    // send, so Kill/Close always get read promptly.
+    loop {
+        match ws_stream.next().await {
+            Some(Ok(Message::Binary(b))) => {
+                if input_tx.send(StepInput::Stdin(b.to_vec())).await.is_err() {
+                    break;
                 }
+            }
+            Some(Ok(Message::Text(t))) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(t.as_str()).unwrap_or(serde_json::Value::Null);
+                if v.get("kill").and_then(|b| b.as_bool()) == Some(true) {
+                    let _ = input_tx.send(StepInput::Kill).await;
+                } else if v.get("stdin_close").and_then(|b| b.as_bool()) == Some(true) {
+                    let _ = input_tx.send(StepInput::StdinClose).await;
+                }
+                // Other text frames are ignored as forward-compat.
+            }
+            Some(Ok(Message::Ping(p))) => {
+                // try_send: pongs are advisory; dropping one under load is
+                // fine, blocking the inbound loop behind the sink is not.
+                let _ = pong_tx.try_send(p.to_vec());
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                if let Some(tx) = cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+                break;
             }
         }
     }
 
     // Drop input_tx so any pending input branch in run_eval observes EOF
-    // promptly and the step_task can wind down.
+    // promptly; drop pong_tx so the outbound task's pong branch goes dormant.
     drop(input_tx);
+    drop(pong_tx);
 
-    // Wait for step_frame to finish so we can send the terminal result.
-    let final_msg = match step_task.await {
-        Ok(Ok((id, outcome))) => json!({"result": {
-            "ok": true,
-            "frame_id": id.as_str(),
-            "outcome": outcome_to_json(&outcome),
-        }}),
-        Ok(Err(e)) => json!({"result": {"ok": false, "error": e.to_string()}}),
-        Err(e) => json!({"result": {"ok": false, "error": format!("panic: {e}")}}),
+    // Wait for step_frame to finish (hard_kill has run either way). The
+    // outbound task ends right after: step_frame's event senders are gone,
+    // so its `event_rx.recv()` returns None.
+    let result = step_task.await;
+    let Ok(mut ws_sink) = outbound.await else {
+        return;
+    };
+    let body = match result {
+        Ok(Ok((id, outcome))) => step_result_ok(&id, &outcome),
+        Ok(Err(e)) => step_result_err(e.to_string()),
+        Err(e) => step_result_err(format!("panic: {e}")),
     };
     let _ = ws_sink
-        .send(Message::Text(final_msg.to_string().into()))
+        .send(control_frame(&StepControl::Result(body)))
         .await;
     let _ = ws_sink.send(Message::Close(None)).await;
+}
+
+/// Serialize a [`StepControl`] into a WS text frame.
+fn control_frame(c: &StepControl) -> Message {
+    Message::Text(
+        serde_json::to_string(c)
+            .expect("StepControl serializes")
+            .into(),
+    )
 }
 
 /// Send one `StepEvent` over the WS sink.
@@ -548,7 +650,7 @@ where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     let msg = match ev {
-        StepEvent::Phase(name) => Message::Text(json!({"phase": name}).to_string().into()),
+        StepEvent::Phase(name) => control_frame(&StepControl::Phase(name.to_owned())),
         StepEvent::Stream {
             stream: agent_protocol::Stream::Stdout,
             data,
@@ -562,7 +664,7 @@ where
             // frames as raw guest stdout (e.g. SSH bytes from dropbear's
             // stdout) doesn't get them interleaved with stderr noise.
             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            Message::Text(json!({"stderr": b64}).to_string().into())
+            control_frame(&StepControl::Stderr(b64))
         }
     };
     sink.send(msg).await
@@ -570,44 +672,77 @@ where
 
 fn build_event_to_sse(ev: BuildEvent) -> Event {
     match ev {
-        BuildEvent::Log { source, line } => Event::default()
-            .event("log")
-            .data(json!({"source": source, "line": line}).to_string()),
-        BuildEvent::Phase(name) => Event::default()
-            .event("phase")
-            .data(json!({"name": name}).to_string()),
+        BuildEvent::Log { source, line } => Event::default().event("log").data(
+            serde_json::to_string(&LogEvent {
+                source: source.to_owned(),
+                line,
+            })
+            .expect("LogEvent serializes"),
+        ),
+        BuildEvent::Phase(name) => Event::default().event("phase").data(
+            serde_json::to_string(&PhaseEvent {
+                name: name.to_owned(),
+            })
+            .expect("PhaseEvent serializes"),
+        ),
         BuildEvent::Ready => Event::default().event("ready").data(""),
     }
 }
 
 fn step_event_to_sse(ev: StepEvent) -> Event {
     match ev {
-        StepEvent::Phase(name) => Event::default()
-            .event("phase")
-            .data(json!({"name": name}).to_string()),
+        StepEvent::Phase(name) => Event::default().event("phase").data(
+            serde_json::to_string(&PhaseEvent {
+                name: name.to_owned(),
+            })
+            .expect("PhaseEvent serializes"),
+        ),
         StepEvent::Stream { stream, data } => {
             let kind = match stream {
                 agent_protocol::Stream::Stdout => "stdout",
                 agent_protocol::Stream::Stderr => "stderr",
             };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            Event::default()
-                .event(kind)
-                .data(json!({"data": b64}).to_string())
+            Event::default().event(kind).data(
+                serde_json::to_string(&DataEvent { data: b64 }).expect("DataEvent serializes"),
+            )
         }
     }
 }
 
-fn result_event(body: serde_json::Value) -> Event {
-    Event::default().event("result").data(body.to_string())
+fn result_event<T: Serialize>(body: &T) -> Event {
+    Event::default()
+        .event("result")
+        .data(serde_json::to_string(body).expect("result payload serializes"))
 }
 
-fn outcome_to_json(o: &StepOutcome) -> serde_json::Value {
+fn step_result_ok(id: &FrameId, outcome: &StepOutcome) -> StepResult {
+    StepResult {
+        ok: true,
+        frame_id: Some(id.as_str().to_owned()),
+        outcome: Some(outcome_to_proto(outcome)),
+        error: None,
+    }
+}
+
+fn step_result_err(error: String) -> StepResult {
+    StepResult {
+        ok: false,
+        frame_id: None,
+        outcome: None,
+        error: Some(error),
+    }
+}
+
+fn outcome_to_proto(o: &StepOutcome) -> Outcome {
     match o {
-        StepOutcome::Exited(agent_protocol::ExitResult::Code(c)) => json!({"exited": {"code": c}}),
-        StepOutcome::Exited(agent_protocol::ExitResult::Signal(s)) => {
-            json!({"exited": {"signal": s}})
+        StepOutcome::Exited(agent_protocol::ExitResult::Code(c)) => {
+            Outcome::Exited(Exit::Code(*c as i64))
         }
-        StepOutcome::SpawnFailed(e) => json!({"spawn_failed": e.to_string()}),
+        StepOutcome::Exited(agent_protocol::ExitResult::Signal(s)) => {
+            Outcome::Exited(Exit::Signal(*s as i64))
+        }
+        StepOutcome::SpawnFailed(e) => Outcome::SpawnFailed(e.to_string()),
+        StepOutcome::WaitFailed(e) => Outcome::WaitFailed(e.to_string()),
     }
 }

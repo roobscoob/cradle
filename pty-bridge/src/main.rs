@@ -34,7 +34,25 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// Upper bound on a single control-frame payload. The CLI never sends more
+/// than a few KiB (keystrokes, winsize), so anything huge means the framing
+/// desynced — without this check a garbage length like 0xFFFFFFFF would ask
+/// the allocator for ~4 GiB inside a 1 GiB guest and abort the bridge.
+const MAX_FRAME_LEN: usize = 1 << 20;
+
+/// How long after the direct child exits we keep draining PTY output that a
+/// backgrounded grandchild (still holding the slave) may be producing. The
+/// bridge's contract is "exit when the command exits"; this window just
+/// catches the command's own final buffered output.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(500);
+/// Poll granularity for the output pump. Doubles as the "quiet period" after
+/// child exit: one data-less poll interval past exit and we're done.
+const POLL_INTERVAL_MS: i32 = 50;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -134,12 +152,49 @@ fn main() {
     let master_w = dup_or_exit(master);
 
     // Output pump: PTY master → our stdout, verbatim. Ends when the master
-    // returns EOF/EIO (which Linux does once the child closes the slave).
+    // returns EOF/EIO (which Linux does once the LAST slave fd closes) — OR
+    // shortly after the direct child exits. The second condition is the one
+    // that matters when the command backgrounds something (`some-server &`):
+    // the grandchild inherits the slave and keeps it open, so the master
+    // never EOFs, and waiting for it would hang the bridge — and with it the
+    // whole step — forever. The agent kills anything left in the eval's
+    // cgroup once we exit, so nothing outlives the step either way.
+    let child_exited = Arc::new(AtomicBool::new(false));
+    let child_exited_r = Arc::clone(&child_exited);
     let reader = thread::spawn(move || {
         let mut master_file = unsafe { std::fs::File::from_raw_fd(master_r) };
         let mut stdout = std::io::stdout().lock();
         let mut buf = [0u8; 16 * 1024];
+        let mut drain_deadline: Option<Instant> = None;
         loop {
+            if drain_deadline.is_none() && child_exited_r.load(Ordering::Relaxed) {
+                drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
+            }
+            if let Some(d) = drain_deadline {
+                if Instant::now() >= d {
+                    break;
+                }
+            }
+            let mut pfd = libc::pollfd {
+                fd: master_r,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, POLL_INTERVAL_MS) };
+            if rc < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if rc == 0 {
+                // Timed out with no data. Quiet after the child exited means
+                // its buffered output is drained — done.
+                if drain_deadline.is_some() {
+                    break;
+                }
+                continue;
+            }
             match master_file.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -165,6 +220,13 @@ fn main() {
             }
             let frame_type = header[0];
             let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            if len > MAX_FRAME_LEN {
+                // Framing desync — there is no way to resync a corrupt
+                // length-prefixed stream, so stop consuming input. (The
+                // output pump and the command keep running.)
+                eprintln!("pty-bridge: control frame of {len} bytes exceeds {MAX_FRAME_LEN}; input desynced, stopping input pump");
+                break;
+            }
             let mut payload = vec![0u8; len];
             if stdin.read_exact(&mut payload).is_err() {
                 break;
@@ -197,10 +259,14 @@ fn main() {
         }
     });
 
-    // Wait for the command, then drain any remaining PTY output before we
-    // exit (joining the reader guarantees the last bytes reach stdout).
-    // The input pump thread is left blocked on stdin; process exit reaps it.
+    // Wait for the command, then give the output pump a bounded window to
+    // drain the last PTY bytes (joining the reader guarantees they reach
+    // stdout). Bounded, not until-EOF: a backgrounded grandchild can hold
+    // the slave open indefinitely, and the bridge's contract is to exit when
+    // the *command* exits. The input pump thread is left blocked on stdin;
+    // process exit reaps it.
     let _ = child.wait();
+    child_exited.store(true, Ordering::Relaxed);
     let _ = reader.join();
 }
 

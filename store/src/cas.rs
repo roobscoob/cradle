@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 /// A 256-bit `blake3` content hash. This is the address of a blob.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash, Serialize, Deserialize)]
@@ -104,6 +105,25 @@ impl LocalCas {
 /// of different blobs never collide on the same scratch path.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Removes the temp file on drop unless disarmed — covers write errors,
+/// rename errors, and a caller cancelling the `put` future mid-write (all of
+/// which would otherwise strand a `.tmp.*` file in the shard dir forever).
+struct TmpGuard(Option<PathBuf>);
+
+impl TmpGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 impl Cas for LocalCas {
     async fn put(&self, bytes: &[u8]) -> io::Result<Hash> {
         let hash = Hash::of(bytes);
@@ -117,19 +137,25 @@ impl Cas for LocalCas {
         tokio::fs::create_dir_all(dir).await?;
 
         // Write to a unique temp file, then rename into place so a reader never
-        // observes a half-written blob.
+        // observes a half-written blob. fsync before the rename: on many
+        // filesystems a rename can be persisted before the data it points at,
+        // so a crash could otherwise leave a durable-but-empty blob that `has`
+        // reports present and `get` serves corrupt — permanently, since a CAS
+        // never re-fetches a hash it believes it holds.
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".tmp.{}.{seq}", std::process::id()));
-        tokio::fs::write(&tmp, bytes).await?;
+        let mut guard = TmpGuard(Some(tmp.clone()));
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(bytes).await?;
+        f.sync_data().await?;
+        drop(f);
         match tokio::fs::rename(&tmp, &path).await {
-            Ok(()) => {}
+            Ok(()) => guard.disarm(),
             // A concurrent put of the *same* bytes may have won the race; the
-            // content is identical, so just drop our temp. (rename-over-existing
-            // also fails on Windows, so this branch is the normal dedup path
-            // there.)
-            Err(_) if tokio::fs::try_exists(&path).await.unwrap_or(false) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-            }
+            // content is identical, so just drop our temp (the guard removes
+            // it). (rename-over-existing also fails on Windows, so this branch
+            // is the normal dedup path there.)
+            Err(_) if tokio::fs::try_exists(&path).await.unwrap_or(false) => {}
             Err(e) => return Err(e),
         }
         Ok(hash)

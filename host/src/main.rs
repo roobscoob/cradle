@@ -67,6 +67,11 @@ async fn main() {
     );
 
     let frames = frame::FrameStore::new().expect("create FrameStore");
+    // Refuse to run on a filesystem that can't report holes: Diff-snapshot
+    // dirty-page extraction would silently zero clean pages in every child
+    // frame (see ops::probe_store_fs / ops::read_dirty_pages). Also warns
+    // once if reflink is unavailable (correct but O(image) captures).
+    ops::probe_store_fs(frames.root()).expect("frame store filesystem check");
     let state = Arc::new(http::AppState {
         installation: Arc::new(installation),
         frames,

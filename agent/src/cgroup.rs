@@ -19,6 +19,10 @@ pub struct Cgroup {
 impl Cgroup {
     pub fn create() -> io::Result<Self> {
         let parent = agent_cgroup_root()?;
+        // Uniqueness: NEXT_ID is monotonic within this process, and
+        // `reap_stale` (startup) seeds it past any eval-N dir left behind by
+        // a previous run — so a collision here is a real error, not a case
+        // to paper over.
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!("eval-{id}"));
         fs::create_dir(&path)?;
@@ -45,13 +49,46 @@ impl Cgroup {
             }
         }
     }
+
+    /// Kill, wait (bounded) for the process tree to actually drain, then
+    /// rmdir. `cgroup.kill` returns before the SIGKILLed tasks are reaped, so
+    /// an immediate rmdir races slow-exiting descendants into EBUSY — and a
+    /// leaked eval-N dir gets captured into the snapshot and inherited by
+    /// every fork of that frame. Called before ProcessExit is sent (i.e.
+    /// before the host snapshots); the sync `Drop` remains as a best-effort
+    /// fallback for early-error paths.
+    pub async fn destroy(&self) {
+        self.kill();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match fs::read_to_string(self.path.join("cgroup.procs")) {
+                Ok(s) if s.trim().is_empty() => break,
+                Err(_) => break, // dir gone already
+                Ok(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                log::error!(
+                    "cgroup {} still has tasks after 5s; leaking dir",
+                    self.path.display()
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if let Err(e) = fs::remove_dir(&self.path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::error!("rmdir {} failed: {e}", self.path.display());
+            }
+        }
+    }
 }
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        // rmdir fails with EBUSY if any task is still in the cgroup. By the
-        // time we drop, handle_eval has already waited on the child, so the
-        // cgroup should be empty — but log if it isn't.
+        // Best-effort fallback for paths that never reached `destroy` (spawn
+        // failure, task abort). rmdir fails with EBUSY if any task is still
+        // in the cgroup; `create` skips over leftovers and `reap_stale`
+        // retries them on the next agent start, so just log.
         if let Err(e) = fs::remove_dir(&self.path) {
             if e.kind() != io::ErrorKind::NotFound {
                 log::error!("rmdir {} failed: {e}", self.path.display());
@@ -94,8 +131,12 @@ pub fn ensure_parent() -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort cleanup of eval cgroups left behind by a previous agent
-/// run (e.g. after a service restart).
+/// Best-effort cleanup of eval cgroups left behind by a previous agent run
+/// (e.g. after a service restart) — and the uniqueness anchor for `create`:
+/// NEXT_ID is advanced past every eval-N seen, so even a dir that survives
+/// reaping (a task stuck in D-state that SIGKILL can't reap) can never
+/// collide with a new eval. The filesystem is the source of truth for which
+/// names are taken; one scan here beats guessing at create time.
 pub fn reap_stale() {
     let parent = match agent_cgroup_root() {
         Ok(p) => p,
@@ -105,23 +146,36 @@ pub fn reap_stale() {
         Ok(it) => it,
         Err(_) => return,
     };
+    let mut max_seen: u64 = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        // Only reap directories we recognise as ours; don't touch
-        // anything systemd put here.
-        let is_eval_cg = path
+        // Only touch directories we recognise as ours (`eval-<number>`, the
+        // only shape `create` produces); don't reap anything systemd put here.
+        let Some(n) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|s| s.starts_with("eval-"));
-        if !is_eval_cg {
+            .and_then(|s| s.strip_prefix("eval-"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
             continue;
-        }
+        };
+        max_seen = max_seen.max(n);
         let _ = fs::write(path.join("cgroup.kill"), b"1");
-        let _ = fs::remove_dir(&path);
+        // The kill returns before the tasks are reaped; give the rmdir a few
+        // bounded retries instead of giving up on the first EBUSY. (Runs
+        // once at agent startup, so the short blocking sleeps are fine.)
+        for _ in 0..10 {
+            match fs::remove_dir(&path) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
     }
+    NEXT_ID.fetch_max(max_seen + 1, Ordering::Relaxed);
 }
 
 /// Write our own pid into `cgroup.procs` using only async-signal-safe syscalls.

@@ -18,6 +18,11 @@
   networking.defaultGateway = "192.168.1.1";
   networking.nameservers = [ "1.1.1.1" "8.8.8.8" ];
 
+  # The host binds 0.0.0.0:8080 (host/src/main.rs BIND_ADDR) for remote CLI
+  # clients on the LAN; NixOS's firewall is on by default, so the port must
+  # be opened explicitly or only localhost can reach the API.
+  networking.firewall.allowedTCPPorts = [ 8080 ];
+
   services.getty.autologinUser = "root";
   users.users.root.password = "";
 

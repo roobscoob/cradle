@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "agent-protocol", "cli", "host", "pty-bridge", "store"]
+members = ["agent", "agent-protocol", "cli", "client-protocol", "host", "pty-bridge", "store"]
 # `agent` only builds on Linux (vsock + unix process APIs), so skip it for
 # default cargo commands run from the workspace root. Build it explicitly
 # via `cargo build -p agent` on Linux, or through `nix build .#agent`.
@@ -9,5 +9,5 @@ members = ["agent", "agent-protocol", "cli", "host", "pty-bridge", "store"]
 # `cli` is cross-platform — Windows, macOS, Linux all welcome.
 # `store` is pure logic (CAS + page-tree), cross-platform, so it's in the
 # defaults — `cargo test` from the root exercises it on any OS.
-default-members = ["agent-protocol", "cli", "store"]
+default-members = ["agent-protocol", "cli", "client-protocol", "store"]
 resolver = "3"

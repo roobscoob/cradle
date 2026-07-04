@@ -11,6 +11,7 @@ prod = []
 
 [dependencies]
 agent-protocol = { path = "../agent-protocol" }
+client-protocol = { path = "../client-protocol" }
 store = { path = "../store" }
 async-stream = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }

@@ -1,10 +1,6 @@
 use std::{io, path::PathBuf, process::Stdio};
 
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::Command,
-    sync::mpsc,
-};
+use tokio::{io::BufReader, process::Command, sync::mpsc};
 
 const GUEST_FLAKE: &str = env!("CRADLE_GUEST_FLAKE");
 
@@ -85,12 +81,19 @@ pub(crate) async fn run_nix_build(
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Cancellation story: builds have no timeout by design (arbitrarily
+        // long is fine), but they must be cancellable — build_frame races
+        // this future against the client's cancel signal, and dropping it
+        // must take the nix process down with it.
+        .kill_on_drop(true)
         .spawn()?;
 
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Lossy line reads: nix stderr is not guaranteed UTF-8, and a strict
+        // `lines()` loop would silently stop streaming at the first raw byte.
+        let mut stderr = BufReader::new(stderr);
+        while let Some(line) = crate::ops::next_line_lossy(&mut stderr).await {
             if let Some(text) = extract_progress(&line) {
                 eprintln!("\x1b[35m[nix]\x1b[0m {text}");
                 if let Some(tx) = progress.as_ref() {

@@ -26,10 +26,13 @@ fn parse_event(text: &str) -> Option<Result<Event>> {
     let mut data = String::new();
     let mut saw_meaningful = false;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            name = rest.to_owned();
+        // Per the SSE spec the space after the field colon is OPTIONAL —
+        // require only the field name and strip at most one leading space.
+        if let Some(rest) = line.strip_prefix("event:") {
+            name = rest.strip_prefix(' ').unwrap_or(rest).to_owned();
             saw_meaningful = true;
-        } else if let Some(rest) = line.strip_prefix("data: ") {
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
             if !data.is_empty() {
                 data.push('\n');
             }
@@ -63,23 +66,6 @@ pub async fn post_sse(
     response_to_events(req.send().await.context("POST request failed")?).await
 }
 
-/// POST to `url` with a JSON body and stream the response as parsed SSE events.
-pub async fn post_sse_json(
-    client: &reqwest::Client,
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<mpsc::UnboundedReceiver<Result<Event>>> {
-    response_to_events(
-        client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .context("POST request failed")?,
-    )
-    .await
-}
-
 async fn response_to_events(
     resp: reqwest::Response,
 ) -> Result<mpsc::UnboundedReceiver<Result<Event>>> {
@@ -98,10 +84,23 @@ async fn response_to_events(
             match chunk {
                 Ok(b) => {
                     buf.extend_from_slice(&b);
-                    // Drain any complete events from the buffer.
-                    while let Some(term) = buf.windows(2).position(|w| w == b"\n\n") {
-                        let raw = buf.drain(..term + 2).collect::<Vec<u8>>();
-                        let text = String::from_utf8_lossy(&raw[..raw.len() - 2]).into_owned();
+                    // Drain any complete events from the buffer. Events end
+                    // at a blank line — LF-LF from our host, but CRLF-CRLF
+                    // is equally spec-legal, so accept both (whichever
+                    // terminator appears first).
+                    loop {
+                        let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+                        let crlf = buf
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| (p, 4));
+                        let Some((term, tlen)) =
+                            [lf, crlf].into_iter().flatten().min_by_key(|&(p, _)| p)
+                        else {
+                            break;
+                        };
+                        let raw = buf.drain(..term + tlen).collect::<Vec<u8>>();
+                        let text = String::from_utf8_lossy(&raw[..term]).into_owned();
                         // `None` = keep-alive comment; skip silently.
                         let Some(event) = parse_event(&text) else { continue };
                         if tx.send(event).is_err() {

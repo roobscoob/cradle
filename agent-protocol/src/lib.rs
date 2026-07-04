@@ -11,6 +11,14 @@ use std::io;
 
 pub use postcard::Error as CodecError;
 
+/// vsock addressing shared by the host and the agent. Defined once here so
+/// the two sides can't drift: the agent dials out to (VSOCK_HOST_CID,
+/// VSOCK_HOST_PORT); firecracker forwards that to the host's AF_UNIX
+/// listener at `<vsock_uds>_<port>`.
+pub const VSOCK_HOST_CID: u32 = 2;
+pub const VSOCK_HOST_PORT: u32 = 1024;
+pub const VSOCK_GUEST_CID: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stream {
     Stdout,
@@ -48,6 +56,12 @@ pub enum AgentMessage {
     /// Periodic liveness write. The host discards it; the agent uses the
     /// write succeeding/failing as its dead-connection detector.
     Heartbeat,
+    /// The child was spawned and ran, but `wait()` errored afterwards. Unlike
+    /// `ProcessErr` (spawn-time failure, VM state provably unchanged), the
+    /// process DID execute and may have mutated the frame — the host must not
+    /// report this as "spawn failed". Appended last so older decoders keep
+    /// their postcard variant indices.
+    ProcessWaitErr(#[serde(with = "io_error_serde")] io::Error),
 }
 
 /// Messages emitted by the host and consumed by the agent.
@@ -90,13 +104,35 @@ fn encode_into<T: Serialize + ?Sized>(value: &T, out: &mut Vec<u8>) -> Result<()
 // Sans-IO decoders
 // ---------------------------------------------------------------------------
 
-/// Buffers bytes from the wire and yields complete `AgentMessage`s.
-#[derive(Debug, Default)]
-pub struct AgentMessageDecoder {
+/// Buffers bytes from the wire and yields complete messages of type `T`.
+/// One implementation for both directions — see the aliases below.
+#[derive(Debug)]
+pub struct Decoder<T> {
     buf: Vec<u8>,
+    /// Bytes already scanned for a sentinel without finding one. Lets each
+    /// `next_message` resume the scan where the last one stopped instead of
+    /// rescanning the whole partial frame from offset 0 on every push
+    /// (O(N²) on a large frame delivered in many reads).
+    scanned: usize,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl AgentMessageDecoder {
+/// Buffers bytes from the wire and yields complete `AgentMessage`s.
+pub type AgentMessageDecoder = Decoder<AgentMessage>;
+/// Buffers bytes from the wire and yields complete `HostMessage`s.
+pub type HostMessageDecoder = Decoder<HostMessage>;
+
+impl<T> Default for Decoder<T> {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            scanned: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: for<'de> Deserialize<'de>> Decoder<T> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -108,44 +144,20 @@ impl AgentMessageDecoder {
 
     /// Try to decode the next complete message. Returns `Ok(None)` when no
     /// full COBS frame has arrived yet.
-    pub fn next_message(&mut self) -> Result<Option<AgentMessage>, CodecError> {
-        next_cobs_frame(&mut self.buf)
+    pub fn next_message(&mut self) -> Result<Option<T>, CodecError> {
+        let Some(rel_idx) = self.buf[self.scanned..].iter().position(|&b| b == 0) else {
+            self.scanned = self.buf.len();
+            return Ok(None);
+        };
+        let sentinel_idx = self.scanned + rel_idx;
+        // Drain through the sentinel, then drop the trailing 0x00 because
+        // postcard's COBS decoder operates on the encoded bytes only.
+        let mut frame: Vec<u8> = self.buf.drain(..=sentinel_idx).collect();
+        frame.pop();
+        self.scanned = 0;
+        let msg = postcard::from_bytes_cobs::<T>(&mut frame)?;
+        Ok(Some(msg))
     }
-}
-
-/// Buffers bytes from the wire and yields complete `HostMessage`s.
-#[derive(Debug, Default)]
-pub struct HostMessageDecoder {
-    buf: Vec<u8>,
-}
-
-impl HostMessageDecoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
-    }
-
-    pub fn next_message(&mut self) -> Result<Option<HostMessage>, CodecError> {
-        next_cobs_frame(&mut self.buf)
-    }
-}
-
-fn next_cobs_frame<T>(buf: &mut Vec<u8>) -> Result<Option<T>, CodecError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let Some(sentinel_idx) = buf.iter().position(|&b| b == 0) else {
-        return Ok(None);
-    };
-    // Drain through the sentinel, then drop the trailing 0x00 because
-    // postcard's COBS decoder operates on the encoded bytes only.
-    let mut frame: Vec<u8> = buf.drain(..=sentinel_idx).collect();
-    frame.pop();
-    let msg = postcard::from_bytes_cobs::<T>(&mut frame)?;
-    Ok(Some(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +311,18 @@ mod tests {
             AgentMessage::ProcessErr(got) => {
                 assert_eq!(got.kind(), io::ErrorKind::PermissionDenied);
                 assert_eq!(got.to_string(), "nope");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_wait_err_roundtrip() {
+        let err = io::Error::new(io::ErrorKind::Interrupted, "wait interrupted");
+        match roundtrip_agent(AgentMessage::ProcessWaitErr(err)) {
+            AgentMessage::ProcessWaitErr(got) => {
+                assert_eq!(got.kind(), io::ErrorKind::Interrupted);
+                assert_eq!(got.to_string(), "wait interrupted");
             }
             other => panic!("wrong variant: {other:?}"),
         }

@@ -10,7 +10,7 @@ http:
     type: json
     data: |-
       {
-        "binary": "sh",
+        "binary": "/bin/sh",
         "argv": ["-c", "echo 'Hi!' > /hi.txt"],
         "cwd": "/"
       }

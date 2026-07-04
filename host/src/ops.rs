@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use agent_protocol::{AgentMessage, ExitResult, HostMessage};
+use agent_protocol::{AgentMessage, ExitResult, HostMessage, VSOCK_GUEST_CID, VSOCK_HOST_PORT};
 use fctools::{
     process_spawner::DirectProcessSpawner,
     runtime::tokio::TokioRuntime,
@@ -55,12 +55,11 @@ use crate::{
     user_flake::{UserArtifacts, build_user_artifacts},
 };
 
-const GUEST_CID: u32 = 3;
-/// Port the agent dials on the host. The host pre-creates an AF_UNIX
-/// listener at `<jail>/vsock.sock_<HOST_PORT>`; firecracker forwards the
-/// guest's connection to (host CID 2, HOST_PORT) there. The agent dials
-/// out and the host accepts — see `accept_agent`.
-const HOST_PORT: u32 = 1024;
+// vsock CIDs/port are shared with the agent via `agent-protocol`
+// (VSOCK_GUEST_CID / VSOCK_HOST_PORT) so the two sides can't drift. The host
+// pre-creates an AF_UNIX listener at `<jail>/vsock.sock_<port>`; firecracker
+// forwards the guest's connection to (host CID 2, port) there. The agent
+// dials out and the host accepts — see `accept_agent`.
 const VM_START_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on how long we wait for the agent to (re)connect after a restore.
 /// The agent reconnects on its own once its heartbeat write fails, so this
@@ -169,12 +168,10 @@ pub enum StepInput {
     Kill,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct EvalRequest {
-    pub binary: String,
-    pub argv: Vec<String>,
-    pub cwd: String,
-}
+// The step request shape is shared with the CLI via `client-protocol` so the
+// two sides can't skew (a serde mismatch here used to surface as a silently
+// dropped error frame on the client).
+pub use client_protocol::EvalRequest;
 
 /// What happened to a step's eval, as reported by the agent. Both variants
 /// represent agent-clean outcomes — the agent finished its work and the VM
@@ -189,6 +186,10 @@ pub enum StepOutcome {
     /// the binary path, EACCES on the cwd). VM state is provably unchanged
     /// from the parent frame in this case.
     SpawnFailed(std::io::Error),
+    /// The child spawned and ran, but the agent's `wait()` errored. Unlike
+    /// `SpawnFailed`, the process executed and may have mutated the frame —
+    /// only its exit status is unknown. Still snapshotted.
+    WaitFailed(std::io::Error),
 }
 
 /// Build a frame from scratch.
@@ -207,47 +208,21 @@ pub async fn build_frame(
     artifacts: Arc<ServerArtifacts>,
     user_flake_dir: Option<PathBuf>,
     events: mpsc::Sender<BuildEvent>,
+    mut cancel: oneshot::Receiver<()>,
 ) -> Result<FrameId, OpError> {
-    // All four boot artifacts (kernel, initrd, storeDisk, cmdline) come as
-    // a coherent bundle from ONE nixosSystem — either the host's pre-built
-    // `guest` config (default path) or a per-request wrapper around the
-    // user's `nixosModules.guest` (user-flake path). They cannot be mixed
-    // across configs: microvm.nix encodes
-    // `init=/nix/store/<this-system>/init` in `kernelParams`, and that path
-    // only resolves inside the matching system's closure.
-    let bundle: UserArtifacts = match user_flake_dir {
-        Some(dir) => {
-            let _ = events.send(BuildEvent::Phase("nix_build")).await;
-            let (nix_tx, nix_rx) = mpsc::channel::<String>(64);
-            let nix_forward = spawn_log_forwarder(nix_rx, "nix", events.clone());
-            let scratch = store
-                .root()
-                .join("user-builds")
-                .join(format!("ub-{}", Ulid::new()));
-            tokio::fs::create_dir_all(&scratch)
-                .await
-                .map_err(OpError::io)?;
-            let result = build_user_artifacts(
-                &dir,
-                &scratch,
-                &artifacts.agent_static,
-                &artifacts.pty_bridge_static,
-                Some(nix_tx),
-            )
-            .await
-            .map_err(OpError::io)?;
-            let _ = nix_forward.await;
-            result
-        }
-        None => UserArtifacts {
-            kernel: artifacts.default_kernel.clone(),
-            initrd: artifacts.default_initrd.clone(),
-            store_disk: artifacts.default_store_disk.clone(),
-            cmdline: artifacts.default_cmdline.clone(),
-        },
+    // Phase 1 — no VM yet: resolve the boot bundle. Raced against `cancel`
+    // so a client disconnect aborts a long nix build instead of letting it
+    // run detached to completion; dropping the future kills the child `nix`
+    // process (`kill_on_drop` in `run_nix_build`). Builds are deliberately
+    // NOT time-bounded — arbitrarily long is fine, they just have to be
+    // cancellable.
+    let bundle: UserArtifacts = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err(OpError::vmm("client cancelled".into())),
+        r = resolve_bundle(&store, &artifacts, user_flake_dir, &events) => r?,
     };
 
-    // Build the config and run.
+    // Phase 2 — build the config and run.
     let _ = events.send(BuildEvent::Phase("preparing")).await;
     let cmdline = read_cmdline(&bundle.cmdline).await?;
     let runtime = new_op_runtime(&store)?;
@@ -273,16 +248,92 @@ pub async fn build_frame(
         .await
         .map_err(|e| OpError::vmm(format!("Vm::prepare: {e:?}")))?;
 
+    // From here on we own a live `vm`: every exit path must reach
+    // `hard_kill` below (a leaked firecracker process pins its KVM fds and
+    // 1 GiB of guest RAM until host restart). The boot→snapshot work is
+    // extracted so an early `?` return can't skip the kill, and so it can be
+    // raced against `cancel` — the same shape `step_frame` uses.
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut cancel => Err(OpError::vmm("client cancelled".into())),
+        r = run_build_after_prepare(&mut vm, &events, &jail_path, serial_log_path, &bundle, &store) => r,
+    };
+
+    hard_kill(vm).await;
+    outcome
+}
+
+/// The boot-bundle half of a build: the per-request wrapper-flake nix build
+/// for an uploaded flake, or the pre-built server defaults. No VM exists yet,
+/// so `build_frame` can cancel this by simply dropping the future.
+///
+/// All four boot artifacts (kernel, initrd, storeDisk, cmdline) come as a
+/// coherent bundle from ONE nixosSystem — either the host's pre-built `guest`
+/// config (default path) or a per-request wrapper around the user's
+/// `nixosModules.guest` (user-flake path). They cannot be mixed across
+/// configs: microvm.nix encodes `init=/nix/store/<this-system>/init` in
+/// `kernelParams`, and that path only resolves inside the matching system's
+/// closure.
+async fn resolve_bundle(
+    store: &Arc<FrameStore>,
+    artifacts: &ServerArtifacts,
+    user_flake_dir: Option<PathBuf>,
+    events: &mpsc::Sender<BuildEvent>,
+) -> Result<UserArtifacts, OpError> {
+    match user_flake_dir {
+        Some(dir) => {
+            let _ = events.send(BuildEvent::Phase("nix_build")).await;
+            let (nix_tx, nix_rx) = mpsc::channel::<String>(64);
+            let nix_forward = spawn_log_forwarder(nix_rx, "nix", events.clone());
+            let scratch = store
+                .root()
+                .join("user-builds")
+                .join(format!("ub-{}", Ulid::new()));
+            tokio::fs::create_dir_all(&scratch)
+                .await
+                .map_err(OpError::io)?;
+            let result = build_user_artifacts(
+                &dir,
+                &scratch,
+                &artifacts.agent_static,
+                &artifacts.pty_bridge_static,
+                Some(nix_tx),
+            )
+            .await
+            .map_err(OpError::io)?;
+            let _ = nix_forward.await;
+            Ok(result)
+        }
+        None => Ok(UserArtifacts {
+            kernel: artifacts.default_kernel.clone(),
+            initrd: artifacts.default_initrd.clone(),
+            store_disk: artifacts.default_store_disk.clone(),
+            cmdline: artifacts.default_cmdline.clone(),
+        }),
+    }
+}
+
+/// Everything between `Vm::prepare` and `hard_kill` in a build. Extracted so
+/// `build_frame` can race it against a cancel signal in a `tokio::select!`,
+/// dropping this future cleanly while still reaching `hard_kill(vm)` outside.
+async fn run_build_after_prepare(
+    vm: &mut Vm<JailedVmmExecutor<CradleResolver>, DirectProcessSpawner, TokioRuntime>,
+    events: &mpsc::Sender<BuildEvent>,
+    jail_path: &Path,
+    serial_log_path: PathBuf,
+    bundle: &UserArtifacts,
+    store: &Arc<FrameStore>,
+) -> Result<FrameId, OpError> {
     // Create the guest→host listener before the guest boots, so it's there
     // when the agent dials out.
-    let listener = create_agent_listener(&jail_path)?;
+    let listener = create_agent_listener(jail_path)?;
 
     let _ = events.send(BuildEvent::Phase("booting")).await;
     vm.start(VM_START_TIMEOUT)
         .await
         .map_err(|e| OpError::vmm(format!("Vm::start: {e:?}")))?;
 
-    let _serial_tasks = spawn_serial_taps(&mut vm, serial_log_path, Some(events.clone()));
+    let _serial_tasks = spawn_serial_taps(vm, serial_log_path, Some(events.clone()));
 
     // Wait for the agent to connect out and send `Hello`. The agent only
     // dials after `cradle-agent.service` is running, which is gated on
@@ -309,10 +360,7 @@ pub async fn build_frame(
         store_disk: &bundle.store_disk,
         cmdline: &bundle.cmdline,
     };
-    let frame_id = snapshot_into_frame(&mut vm, &store, FrameInputs::Fresh(inputs)).await?;
-
-    hard_kill(vm).await;
-    Ok(frame_id)
+    snapshot_into_frame(vm, store, FrameInputs::Fresh(inputs)).await
 }
 
 /// Step a frame: restore the parent's VM state, run one command, snapshot the result.
@@ -404,12 +452,14 @@ pub async fn step_frame(
 
     // From here on we own a live `vm` — wrap everything in a `select!` against
     // cancel so a client disconnect always reaches `hard_kill` below.
+    //
+    // Deliberately NO event send in the cancel arm: cancel means the client
+    // is gone, so nobody would see it — and an `.await` on a full event
+    // channel here would wedge this task forever with the VM alive (the
+    // handler stops draining events once it decides to cancel).
     let outcome = tokio::select! {
         biased;
-        _ = &mut cancel => {
-            let _ = events.send(StepEvent::Phase("cancelled")).await;
-            Err(OpError::vmm("client cancelled".into()))
-        }
+        _ = &mut cancel => Err(OpError::vmm("client cancelled".into())),
         r = run_step_after_prepare(&mut vm, &events, &jail_path, serial_log_path, &parent, &store, eval, inputs) => r,
     };
 
@@ -452,7 +502,7 @@ async fn run_step_after_prepare(
     // `evaluating` is exactly send-eval + drain responses to ProcessExit.
     let _ = events.send(StepEvent::Phase("evaluating")).await;
     send_eval(&mut link, &eval).await?;
-    let outcome = run_eval(&mut link, events, inputs, None).await?;
+    let outcome = run_eval(&mut link, events, inputs).await?;
 
     // Drop the connection before snapshotting. The agent will detect the
     // dead connection via its heartbeat write on the next restore and
@@ -562,7 +612,7 @@ fn base_config_data(
         cpu_template: crate::cpu_template::cradle_cpu_template(),
         balloon_device: None,
         vsock_device: Some(VsockDevice {
-            guest_cid: GUEST_CID,
+            guest_cid: VSOCK_GUEST_CID,
             uds: vsock_uds,
         }),
         logger_system: None,
@@ -656,6 +706,29 @@ async fn append_serial_line(file: &mut Option<tokio::fs::File>, prefix: &str, li
     }
 }
 
+/// Read the next `\n`-terminated line, decoding lossily. Unlike
+/// `AsyncBufReadExt::lines()`, a non-UTF-8 byte doesn't end the stream:
+/// serial output (kernel + arbitrary guest binaries) and nix stderr are not
+/// guaranteed UTF-8, and `next_line()` returning `Err(InvalidData)` used to
+/// silently truncate both transcripts at the first raw byte. Returns `None`
+/// on EOF or a real I/O error.
+pub(crate) async fn next_line_lossy<R>(reader: &mut R) -> Option<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut raw = Vec::new();
+    match reader.read_until(b'\n', &mut raw).await {
+        Ok(0) => None,
+        Ok(_) => {
+            while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
+                raw.pop();
+            }
+            Some(String::from_utf8_lossy(&raw).into_owned())
+        }
+        Err(_) => None,
+    }
+}
+
 fn spawn_serial_to_events<R>(
     reader: R,
     source: &'static str,
@@ -667,13 +740,13 @@ where
 {
     tokio::spawn(async move {
         let mut file = open_serial_log(&serial_log_path).await;
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(reader);
+        while let Some(line) = next_line_lossy(&mut reader).await {
             append_serial_line(&mut file, source, &line).await;
             if tx.send(BuildEvent::Log { source, line }).await.is_err() {
                 // SSE consumer gone — keep draining to the file so the
                 // serial transcript stays complete.
-                while let Ok(Some(line)) = lines.next_line().await {
+                while let Some(line) = next_line_lossy(&mut reader).await {
                     append_serial_line(&mut file, source, &line).await;
                 }
                 return;
@@ -692,8 +765,8 @@ where
 {
     tokio::spawn(async move {
         let mut file = open_serial_log(&serial_log_path).await;
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(reader);
+        while let Some(line) = next_line_lossy(&mut reader).await {
             append_serial_line(&mut file, prefix, &line).await;
             tracing::debug!(target: "cradle::serial", "[{prefix}] {line}");
         }
@@ -720,7 +793,7 @@ fn spawn_log_forwarder(
 /// before `vm.start`). With `VmmOwnershipModel::Shared` the jailed
 /// firecracker runs as our uid, so it can connect to the socket we own.
 fn create_agent_listener(jail_path: &Path) -> Result<UnixListener, OpError> {
-    let path = jail_path.join(format!("vsock.sock_{HOST_PORT}"));
+    let path = jail_path.join(format!("vsock.sock_{VSOCK_HOST_PORT}"));
     // Defensive: a fresh per-op jail shouldn't have a stale socket, but
     // bind() fails on EADDRINUSE if one somehow exists.
     let _ = std::fs::remove_file(&path);
@@ -797,17 +870,7 @@ async fn run_eval(
     link: &mut AgentLink,
     events: &mpsc::Sender<StepEvent>,
     mut inputs: mpsc::Receiver<StepInput>,
-    first_msg: Option<AgentMessage>,
 ) -> Result<StepOutcome, OpError> {
-    // Process the message the caller already pulled off the wire (the one
-    // used to confirm the connection survived TRANSPORT_RESET) before
-    // entering the select loop.
-    if let Some(m) = first_msg {
-        if let Some(out) = consume_agent_msg(events, m).await? {
-            return Ok(out);
-        }
-    }
-
     // Once the inputs channel closes, the SSE handler (which dropped its
     // tx on construction) and a hung-up WS handler both end up here.
     // Disable the branch via a per-branch guard so a closed channel
@@ -870,6 +933,10 @@ async fn consume_agent_msg(
         // that spawn() failed, VM state is unchanged. Treat it like an
         // exit so step_frame still snapshots and produces a child frame.
         AgentMessage::ProcessErr(e) => Ok(Some(StepOutcome::SpawnFailed(e))),
+        // The child spawned and ran but wait() errored — state may have
+        // changed, so this must not masquerade as a spawn failure. Still a
+        // clean terminal outcome: snapshot and report honestly.
+        AgentMessage::ProcessWaitErr(e) => Ok(Some(StepOutcome::WaitFailed(e))),
         AgentMessage::Hello => {
             // Hello is consumed during accept and should not reappear
             // mid-eval. Treat as a protocol violation.
@@ -938,6 +1005,11 @@ async fn snapshot_into_frame(
         .map_err(|e| OpError::vmm(format!("create_snapshot: {e:?}")))?;
 
     let (id, dir) = store.allocate().map_err(OpError::io)?;
+    // Until `finalize` registers the frame, the directory is unreachable by
+    // any id — remove it if we error out or the whole step future is dropped
+    // (client cancel mid-snapshot), instead of stranding an up-to-1-GiB dir
+    // until process exit.
+    let mut dir_guard = FrameDirGuard(Some(dir.clone()));
     let (k, i, s, c) = match &inputs {
         FrameInputs::Fresh(f) => (
             f.kernel.to_path_buf(),
@@ -975,7 +1047,20 @@ async fn snapshot_into_frame(
     };
 
     store.finalize(id.clone(), dir, mem_tree).await;
+    dir_guard.0 = None;
     Ok(id)
+}
+
+/// Removes an allocated-but-not-finalized frame directory on drop. Disarm by
+/// clearing the inner Option once `finalize` has registered the frame.
+struct FrameDirGuard(Option<PathBuf>);
+
+impl Drop for FrameDirGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// Fresh-build ingest: build the whole page-tree from the full mem image.
@@ -1072,8 +1157,16 @@ async fn diff_ingest(
 
 /// Walk a sparse Diff-snapshot mem file with SEEK_DATA/SEEK_HOLE to find the
 /// pages Firecracker actually wrote (the dirty set), as (page_index, bytes).
-/// If the file is NOT sparse, this returns every page — correct, just not a
-/// speedup — so it degrades gracefully.
+///
+/// CORRECTNESS PRECONDITION: the filesystem must report holes. A Diff mem
+/// file contains ONLY the dirtied pages; clean pages are holes that read
+/// back as zeros. On a filesystem that doesn't report holes (9p, virtiofs,
+/// most FUSE), SEEK_DATA claims the whole file is data, so this would return
+/// every clean page as zeros — and `apply_dirty` would then overwrite the
+/// child's reflinked parent memory with those zeros, silently corrupting the
+/// frame (both the image and the tree agree on the corrupt bytes, so even a
+/// byte-compare "verifies"). `probe_store_fs` at host startup refuses to run
+/// on such a filesystem.
 fn read_dirty_pages(diff_path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::io::AsRawFd;
@@ -1114,6 +1207,71 @@ fn read_dirty_pages(diff_path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
         pos = hole;
     }
     Ok(pages)
+}
+
+/// Verify the frame-store filesystem is safe to run on. Called once at host
+/// startup, against the store root (jails — and therefore Diff snapshot mem
+/// files — live under the same root).
+///
+/// Hard requirement: hole reporting (SEEK_DATA/SEEK_HOLE). Without it,
+/// `read_dirty_pages` reads a Diff snapshot's clean pages as dirty zeros and
+/// every child frame restores with mostly-zeroed guest RAM — silent
+/// corruption, so refuse to start (see the doc comment there).
+///
+/// Soft requirement: reflink (FICLONE). Without it every capture degrades to
+/// a full image copy — correct but O(image); warn loudly once instead of
+/// per-op.
+pub fn probe_store_fs(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // Hole probe: an ftruncate-extended file is all hole on any filesystem
+    // that tracks sparseness, so SEEK_DATA from 0 must find no data (ENXIO).
+    // Finding "data" means the fs fakes hole queries (9p/virtiofs/FUSE).
+    let hole_probe = root.join(".fs-probe-hole");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&hole_probe)?;
+    f.set_len((2 * store::memtree::PAGE) as u64)?;
+    let seek = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_DATA) };
+    let seek_err = std::io::Error::last_os_error();
+    drop(f);
+    let _ = std::fs::remove_file(&hole_probe);
+    if seek >= 0 {
+        return Err(std::io::Error::other(format!(
+            "frame store at {} is on a filesystem that does not report holes \
+             (SEEK_DATA on an all-hole file returned data at offset {seek}); \
+             Diff-snapshot dirty-page extraction would silently corrupt child \
+             frames. Put the store on btrfs/XFS/zfs.",
+            root.display()
+        )));
+    }
+    if seek_err.raw_os_error() != Some(libc::ENXIO) {
+        return Err(std::io::Error::other(format!(
+            "frame store at {}: SEEK_DATA probe failed ({seek_err}); cannot \
+             verify hole reporting, refusing to run",
+            root.display()
+        )));
+    }
+
+    // Reflink probe: performance only, warn instead of fail.
+    let src = root.join(".fs-probe-reflink-src");
+    let dst = root.join(".fs-probe-reflink-dst");
+    let reflinked = std::fs::write(&src, [0u8; 16]).and_then(|()| reflink_or_copy(&src, &dst));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    match reflinked {
+        Ok(true) => tracing::info!("store fs probe OK: holes reported, reflink supported"),
+        Ok(false) => tracing::warn!(
+            "store fs at {} cannot reflink — captures will fall back to full \
+             O(image) copies. Use btrfs/XFS/zfs for O(dirty) forks.",
+            root.display()
+        ),
+        Err(e) => tracing::warn!("reflink probe failed ({e}); captures may fall back to copies"),
+    }
+    Ok(())
 }
 
 /// FICLONE ioctl request on Linux (`_IOW(0x94, 9, int)`). Defined locally so we

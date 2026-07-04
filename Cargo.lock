@@ -394,6 +394,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "client-protocol",
  "crossterm",
  "flate2",
  "futures-util",
@@ -407,6 +408,14 @@ dependencies = [
  "tokio-tungstenite 0.27.0",
  "tui-term",
  "vt100",
+]
+
+[[package]]
+name = "client-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1031,6 +1040,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64",
+ "client-protocol",
  "fctools",
  "flate2",
  "futures-util",

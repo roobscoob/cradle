@@ -77,6 +77,18 @@ pub struct ArtifactHashes {
     pub snapshot: Hash,
 }
 
+/// State of a frame's on-disk `mem` image. A capture returns its frame id
+/// the moment the frame is durable in the central store; the local image
+/// (a cache artifact) finishes materializing moments later in a background
+/// task. Restore waits for `Ready` — the degenerate case is exactly the old
+/// synchronous behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemState {
+    Pending,
+    Ready,
+    Failed,
+}
+
 pub struct Frame {
     pub id: FrameId,
     pub dir: PathBuf,
@@ -85,9 +97,34 @@ pub struct Frame {
     /// the canonical tree used to ingest a child in O(dirty) by `update`-ing it.
     pub mem_tree: MemTree,
     pub artifacts: ArtifactHashes,
+    mem_ready: tokio::sync::watch::Receiver<MemState>,
 }
 
 impl Frame {
+    /// Wait until the on-disk mem image is complete. Instant for frames
+    /// whose image was written synchronously (seeds, cold fetches).
+    pub async fn await_mem(&self) -> io::Result<()> {
+        let mut rx = self.mem_ready.clone();
+        loop {
+            match *rx.borrow() {
+                MemState::Ready => return Ok(()),
+                MemState::Failed => {
+                    return Err(io::Error::other(format!(
+                        "frame {}: mem image materialization failed (central copy is intact — refetch)",
+                        self.id
+                    )));
+                }
+                MemState::Pending => {}
+            }
+            if rx.changed().await.is_err() {
+                return Err(io::Error::other(format!(
+                    "frame {}: mem patch task died before completing",
+                    self.id
+                )));
+            }
+        }
+    }
+
     pub fn kernel(&self) -> PathBuf {
         self.dir.join("kernel")
     }
@@ -167,6 +204,7 @@ impl FrameStore {
         self.root.path().join("frames").join(id.as_str())
     }
 
+    /// Register a frame whose mem image is already complete on disk.
     pub async fn finalize(
         &self,
         id: FrameId,
@@ -174,11 +212,39 @@ impl FrameStore {
         mem_tree: MemTree,
         artifacts: ArtifactHashes,
     ) -> Arc<Frame> {
+        let (_, rx) = tokio::sync::watch::channel(MemState::Ready);
+        self.insert(id, dir, mem_tree, artifacts, rx).await
+    }
+
+    /// Register a frame whose mem image is still materializing. The caller's
+    /// background task MUST resolve the returned sender to `Ready`/`Failed`;
+    /// dropping it unresolved fails any waiting restore.
+    pub async fn finalize_pending(
+        &self,
+        id: FrameId,
+        dir: PathBuf,
+        mem_tree: MemTree,
+        artifacts: ArtifactHashes,
+    ) -> (Arc<Frame>, tokio::sync::watch::Sender<MemState>) {
+        let (tx, rx) = tokio::sync::watch::channel(MemState::Pending);
+        let frame = self.insert(id, dir, mem_tree, artifacts, rx).await;
+        (frame, tx)
+    }
+
+    async fn insert(
+        &self,
+        id: FrameId,
+        dir: PathBuf,
+        mem_tree: MemTree,
+        artifacts: ArtifactHashes,
+        mem_ready: tokio::sync::watch::Receiver<MemState>,
+    ) -> Arc<Frame> {
         let frame = Arc::new(Frame {
             id: id.clone(),
             dir,
             mem_tree,
             artifacts,
+            mem_ready,
         });
         self.frames.write().await.insert(id, Arc::clone(&frame));
         frame

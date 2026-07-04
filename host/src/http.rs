@@ -562,7 +562,7 @@ async fn run_step_ws_session(
     ));
     tracing::info!(elapsed_ms = t0.elapsed().as_millis() as u64, "ws_step: step_frame spawned");
 
-    let mut cancel_tx = Some(cancel_tx);
+    let cancel_tx = Some(cancel_tx);
 
     // The two directions run as SEPARATE tasks. A single mux loop had two
     // failure modes this structure removes by construction:

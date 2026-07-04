@@ -471,6 +471,9 @@ pub async fn step_frame(
     // maps each filename to the canonical `/kernel`, `/initrd`, `/store_disk`,
     // `/snapshot`, `/mem` paths inside the jail — the same paths the build
     // used, so the snapshot's embedded block-device path resolves correctly.
+    // The parent's mem image may still be materializing (captures return
+    // their id before the background patch lands). Instant when complete.
+    parent.await_mem().await.map_err(OpError::io)?;
     let kernel = create_moved(&mut rs, parent.kernel())?;
     let initrd = create_moved(&mut rs, parent.initrd())?;
     let store_disk = create_moved(&mut rs, parent.store_disk())?;
@@ -1020,7 +1023,7 @@ async fn consume_agent_msg(
 
 enum FrameInputs<'a> {
     Fresh(FreshInputs<'a>),
-    Parent(&'a Frame),
+    Parent(&'a Arc<Frame>),
 }
 
 /// Source paths for the four pre-snapshot artifacts of a fresh build —
@@ -1035,7 +1038,7 @@ struct FreshInputs<'a> {
 
 async fn snapshot_into_frame(
     vm: &mut Vm<JailedVmmExecutor<CradleResolver>, DirectProcessSpawner, TokioRuntime>,
-    store: &FrameStore,
+    store: &Arc<FrameStore>,
     inputs: FrameInputs<'_>,
 ) -> Result<FrameId, OpError> {
     vm.pause()
@@ -1102,6 +1105,10 @@ async fn snapshot_into_frame(
     reflink_or_copy_quiet(snapshot.snapshot_path.clone(), dir.join("snapshot")).await?;
 
     let child_mem = dir.join("mem");
+    // A step's dirty pages: the commit ships them from memory (they're the
+    // whole diff, already read) and the background patch task writes them
+    // into the child image after the id has been returned.
+    let mut dirty: Vec<(u64, Vec<u8>)> = Vec::new();
     let (mem_tree, parent_id) = match &inputs {
         FrameInputs::Fresh(_) => {
             // Full snapshot: mem_out is the complete image. Copy it in and
@@ -1126,8 +1133,8 @@ async fn snapshot_into_frame(
                 store.cas(),
                 parent,
                 &snapshot.mem_file_path,
-                &child_mem,
                 &mut spans,
+                &mut dirty,
             )
             .await
             .map_err(OpError::io)?;
@@ -1160,13 +1167,17 @@ async fn snapshot_into_frame(
     // (pages, tree nodes, artifacts) plus its record land durably BEFORE the
     // id exists anywhere. A frame id is a promise any machine can cash.
     let tc = std::time::Instant::now();
+    let page_src = match &inputs {
+        FrameInputs::Fresh(_) => PageSource::Image(&child_mem),
+        FrameInputs::Parent(_) => PageSource::Dirty(&dirty),
+    };
     let uploaded = commit_frame_central(
         store,
         &id,
         parent_id.as_ref(),
         &mem_tree,
         &dir,
-        &child_mem,
+        page_src,
         &artifacts,
     )
     .await
@@ -1180,22 +1191,132 @@ async fn snapshot_into_frame(
 
     tracing::info!(
         frame = %id,
-        fc = spans.fc_ms, copy = spans.copy_ms, patch = spans.patch_ms,
+        fc = spans.fc_ms, read_hash = spans.read_hash_ms,
         update = spans.update_ms, art = spans.art_ms, commit = spans.commit_ms,
         dirty_pages = spans.dirty_pages,
         total = t_total.elapsed().as_millis() as u64,
         "capture spans"
     );
 
-    store.finalize(id.clone(), dir, mem_tree, artifacts).await;
+    match &inputs {
+        FrameInputs::Fresh(_) => {
+            // The seed's image was written (and flushed) synchronously.
+            store.finalize(id.clone(), dir, mem_tree, artifacts).await;
+        }
+        FrameInputs::Parent(parent) => {
+            // The frame is durable and its id is about to be returned; the
+            // LOCAL image (a cache artifact) finishes in the background.
+            // Restores of this frame gate on the ready signal.
+            let (_, ready_tx) = store
+                .finalize_pending(id.clone(), dir, mem_tree, artifacts)
+                .await;
+            let store = Arc::clone(store);
+            let parent = Arc::clone(parent);
+            let frame_id = id.clone();
+            tokio::spawn(async move {
+                let r = patch_child_mem(&store, &parent, &frame_id, &child_mem, dirty, &mem_tree)
+                    .await;
+                match r {
+                    Ok(()) => {
+                        let _ = ready_tx.send(crate::frame::MemState::Ready);
+                    }
+                    Err(e) => {
+                        tracing::error!(frame = %frame_id, "child mem patch failed: {e}");
+                        let _ = ready_tx.send(crate::frame::MemState::Failed);
+                    }
+                }
+            });
+        }
+    }
     dir_guard.0 = None;
     Ok(id)
 }
 
+/// Background half of a step capture: materialize the child's full on-disk
+/// mem image (reflink parent + patch dirty pages). Runs after the frame id
+/// has been returned — restore waits on the ready gate, everything else
+/// never needed this file. Also hosts the env-gated reconstruct measurement,
+/// which wants the finished image to compare against.
+async fn patch_child_mem(
+    store: &Arc<FrameStore>,
+    parent: &Arc<Frame>,
+    id: &FrameId,
+    child_mem: &Path,
+    dirty: Vec<(u64, Vec<u8>)>,
+    tree: &MemTree,
+) -> std::io::Result<()> {
+    let t0 = std::time::Instant::now();
+    let parent_mem_path = parent.mem();
+    let child_mem_path = child_mem.to_path_buf();
+    let reflinked =
+        tokio::task::spawn_blocking(move || reflink_or_copy(&parent_mem_path, &child_mem_path))
+            .await
+            .map_err(|e| std::io::Error::other(format!("reflink join: {e}")))??;
+    if !reflinked {
+        tracing::warn!(
+            "mem reflink unsupported on this filesystem — fell back to a full copy; \
+             child-frame creation is O(image), not O(dirty). Use XFS/btrfs/zfs for the store root."
+        );
+    }
+    let copy_ms = t0.elapsed().as_millis() as u64;
+
+    let child_mem_owned = child_mem.to_path_buf();
+    let dirty = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+        apply_dirty(&child_mem_owned, &dirty)?;
+        Ok(dirty)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("patch join: {e}")))??;
+    let patch_ms = t0.elapsed().as_millis() as u64 - copy_ms;
+    tracing::info!(frame = %id, copy_ms, patch_ms, "async patch: child mem image ready");
+
+    // Measurement (CRADLE_RECONSTRUCT_TEST): rebuild the just-captured child
+    // image purely from the parent's image (reflink-by-content) + this
+    // capture's dirty set — exactly what a cross-machine restore would do —
+    // and byte-compare against the real image.
+    if std::env::var_os("CRADLE_RECONSTRUCT_TEST").is_some() {
+        let cas = store.cas();
+        let ti = std::time::Instant::now();
+        let mut index = crate::materialize::LocalIndex::default();
+        index.add_image(cas, parent.mem(), &parent.mem_tree).await?;
+        let index_ms = ti.elapsed().as_millis() as u64;
+
+        let overlay = DirtyOverlay {
+            inner: cas,
+            pages: dirty
+                .iter()
+                .map(|(_, b)| (store::Hash::of(b), b.clone()))
+                .collect(),
+        };
+        let recon = child_mem.with_extension("recon");
+        match crate::materialize::reconstruct(&overlay, tree, &index, &recon).await {
+            Ok(s) => {
+                let recon_ok = files_equal(child_mem, &recon).await.unwrap_or(false);
+                tracing::info!(
+                    index_ms, plan_ms = s.plan_ms, fetch_ms = s.fetch_ms, exec_ms = s.exec_ms,
+                    cloned_pages = s.cloned_pages, gap_pages = s.gap_pages, recon_ok,
+                    "reconstruct measurement — child rebuilt from parent image + dirty set"
+                );
+            }
+            Err(e) => tracing::error!("reconstruct measurement failed: {e}"),
+        }
+        let _ = tokio::fs::remove_file(&recon).await;
+    }
+    Ok(())
+}
+
+/// Where a commit finds page bytes: a seed reads ranges of its (complete,
+/// synchronously-written) image file; a step serves them straight from the
+/// in-memory dirty set — its child image doesn't exist yet.
+enum PageSource<'a> {
+    Image(&'a Path),
+    Dirty(&'a [(u64, Vec<u8>)]),
+}
+
 /// Assemble and durably commit everything the central store is missing for
 /// this frame. The want/have runs over the mem tree (`diff_between` prunes
-/// every subtree the store already holds), pages upload as ranges of the
-/// child's mem image, nodes from the scratch CAS, artifacts as whole files.
+/// every subtree the store already holds), pages upload from `page_src`,
+/// nodes from the scratch CAS, artifacts as whole files.
 /// Returns the number of blobs uploaded.
 async fn commit_frame_central(
     store: &FrameStore,
@@ -1203,7 +1324,7 @@ async fn commit_frame_central(
     parent: Option<&FrameId>,
     mem_tree: &MemTree,
     dir: &Path,
-    child_mem: &Path,
+    page_src: PageSource<'_>,
     artifacts: &ArtifactHashes,
 ) -> std::io::Result<u64> {
     let central = store.central();
@@ -1211,6 +1332,17 @@ async fn commit_frame_central(
 
     let holder = HolderShim(central.as_ref());
     let d = store::memtree::diff_between(store.cas(), &holder, mem_tree).await?;
+
+    // For a step, every missing leaf is by construction one of this
+    // capture's dirty pages (anything else was the parent's, which central
+    // already holds). Index them by hash for the lookup below.
+    let dirty_by_hash: std::collections::HashMap<Hash, &[u8]> = match &page_src {
+        PageSource::Dirty(dirty) => dirty
+            .iter()
+            .map(|(_, b)| (Hash::of(b), b.as_slice()))
+            .collect(),
+        PageSource::Image(_) => std::collections::HashMap::new(),
+    };
 
     // A tree repeats content (zero pages above all): dedup so each blob is
     // packed once. DirStore also guards, but don't ship duplicates at all.
@@ -1221,16 +1353,28 @@ async fn commit_frame_central(
             continue;
         }
         if m.level == 0 {
-            let offset = m.page_base * page;
-            let len = page.min(mem_tree.len - offset);
-            blobs.push((
-                m.hash,
-                BlobSrc::FileRange {
-                    path: child_mem.to_path_buf(),
-                    offset,
-                    len,
-                },
-            ));
+            let src = match &page_src {
+                PageSource::Image(image) => {
+                    let offset = m.page_base * page;
+                    let len = page.min(mem_tree.len - offset);
+                    BlobSrc::FileRange {
+                        path: image.to_path_buf(),
+                        offset,
+                        len,
+                    }
+                }
+                PageSource::Dirty(_) => {
+                    let bytes = dirty_by_hash.get(&m.hash).ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "missing leaf {} is not in this capture's dirty set — \
+                             tree/central invariant breach",
+                            m.hash
+                        ))
+                    })?;
+                    BlobSrc::Mem(bytes.to_vec())
+                }
+            };
+            blobs.push((m.hash, src));
         } else {
             blobs.push((m.hash, BlobSrc::Mem(store.cas().get(&m.hash).await?)));
         }
@@ -1316,8 +1460,8 @@ async fn ingest_full<C: Cas>(cas: &C, mem_path: &Path) -> std::io::Result<MemTre
 #[derive(Debug, Clone, Copy, Default)]
 struct CaptureSpans {
     fc_ms: u64,
-    copy_ms: u64,
-    patch_ms: u64,
+    /// Reading the dirty set off the sparse diff + hashing it.
+    read_hash_ms: u64,
     update_ms: u64,
     art_ms: u64,
     commit_ms: u64,
@@ -1328,106 +1472,47 @@ async fn diff_ingest<C: Cas>(
     cas: &C,
     parent: &Frame,
     diff_mem_path: &Path,
-    child_mem: &Path,
     spans: &mut CaptureSpans,
+    dirty_out: &mut Vec<(u64, Vec<u8>)>,
 ) -> std::io::Result<MemTree> {
     let diff_size = tokio::fs::metadata(diff_mem_path).await?.len();
 
-    // Materialize the child's full mem: reflink the parent's image (O(1)
-    // metadata, blocks shared copy-on-write, holes preserved), then patch the
-    // dirty pages onto it. Reflink + patch is O(dirty); a full copy was O(image).
+    // Read the dirty set off the sparse diff (on the jail-out scratch) and
+    // hash it — the only synchronous work left. The child's full mem image
+    // is NOT written here: the commit ships these bytes from memory, and
+    // the image materializes in a background task after the id returns
+    // (patch_child_mem).
     let t0 = std::time::Instant::now();
-    let parent_mem_path = parent.mem();
-    let child_mem_path = child_mem.to_path_buf();
-    let reflinked =
-        tokio::task::spawn_blocking(move || reflink_or_copy(&parent_mem_path, &child_mem_path))
-            .await
-            .map_err(|e| std::io::Error::other(format!("reflink join: {e}")))??;
-    if !reflinked {
-        tracing::warn!(
-            "mem reflink unsupported on this filesystem — fell back to a full copy; \
-             child-frame creation is O(image), not O(dirty). Use XFS/btrfs/zfs for the store root."
-        );
-    }
-    let copy_ms = t0.elapsed().as_millis() as u64;
-
     let diff_path = diff_mem_path.to_path_buf();
-    let child_mem_owned = child_mem.to_path_buf();
-    let dirty = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(u64, Vec<u8>)>> {
-        let dirty = read_dirty_pages(&diff_path)?;
-        apply_dirty(&child_mem_owned, &dirty)?;
-        Ok(dirty)
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("dirty-extract join: {e}")))??;
-    let dirty_pages = dirty.len();
-    let patch_ms = t0.elapsed().as_millis() as u64 - copy_ms;
-
-    // Hash the dirty pages (CPU, blocking pool) and rebuild only the tree
-    // paths — page bytes are never stored as blobs; they already live in the
-    // child image the patch step just wrote.
-    let tu = std::time::Instant::now();
     let (dirty, leaves) = tokio::task::spawn_blocking(
-        move || -> (Vec<(u64, Vec<u8>)>, Vec<(u64, store::Hash)>) {
+        move || -> std::io::Result<(Vec<(u64, Vec<u8>)>, Vec<(u64, store::Hash)>)> {
+            let dirty = read_dirty_pages(&diff_path)?;
             let leaves = dirty
                 .iter()
                 .map(|(p, b)| (*p, store::Hash::of(b)))
                 .collect();
-            (dirty, leaves)
+            Ok((dirty, leaves))
         },
     )
     .await
-    .map_err(|e| std::io::Error::other(format!("hash join: {e}")))?;
+    .map_err(|e| std::io::Error::other(format!("dirty-extract join: {e}")))??;
+    let dirty_pages = dirty.len();
+    let read_hash_ms = t0.elapsed().as_millis() as u64;
+
+    let tu = std::time::Instant::now();
     let tree = store::memtree::update_hashes(cas, &parent.mem_tree, leaves).await?;
     let update_ms = tu.elapsed().as_millis() as u64;
 
     tracing::info!(
         mem_root = %tree.root, dirty_pages, diff_size,
-        copy_ms, patch_ms, update_ms,
+        read_hash_ms, update_ms,
         "diff ingest OK — O(dirty)"
     );
-    spans.copy_ms = copy_ms;
-    spans.patch_ms = patch_ms;
+    spans.read_hash_ms = read_hash_ms;
     spans.update_ms = update_ms;
     spans.dirty_pages = dirty_pages as u64;
 
-    // Measurement (CRADLE_RECONSTRUCT_TEST): rebuild the just-captured child
-    // image purely from the parent's image (reflink-by-content) + the CAS
-    // (fill) — exactly what a cross-machine restore would do — and time it,
-    // without touching the real child mem. Reconstruct into a temp, byte-compare
-    // to the real one, delete. `index_ms` (building the parent index) is a
-    // setup cost that would be persistent/amortized in real use, so it's logged
-    // separately from the reconstruct itself.
-    if std::env::var_os("CRADLE_RECONSTRUCT_TEST").is_some() {
-        let ti = std::time::Instant::now();
-        let mut index = crate::materialize::LocalIndex::default();
-        index.add_image(cas, parent.mem(), &parent.mem_tree).await?;
-        let index_ms = ti.elapsed().as_millis() as u64;
-
-        // Pages aren't CAS blobs anymore; serve this capture's dirty pages
-        // from memory so the gap-fill (the network stand-in) still resolves.
-        let overlay = DirtyOverlay {
-            inner: cas,
-            pages: dirty
-                .iter()
-                .map(|(_, b)| (store::Hash::of(b), b.clone()))
-                .collect(),
-        };
-        let recon = child_mem.with_extension("recon");
-        match crate::materialize::reconstruct(&overlay, &tree, &index, &recon).await {
-            Ok(s) => {
-                let recon_ok = files_equal(child_mem, &recon).await.unwrap_or(false);
-                tracing::info!(
-                    index_ms, plan_ms = s.plan_ms, fetch_ms = s.fetch_ms, exec_ms = s.exec_ms,
-                    cloned_pages = s.cloned_pages, gap_pages = s.gap_pages, recon_ok,
-                    "reconstruct measurement — child rebuilt from parent image + CAS"
-                );
-            }
-            Err(e) => tracing::error!("reconstruct measurement failed: {e}"),
-        }
-        let _ = tokio::fs::remove_file(&recon).await;
-    }
-
+    *dirty_out = dirty;
     Ok(tree)
 }
 

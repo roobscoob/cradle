@@ -995,6 +995,9 @@ async fn snapshot_into_frame(
         .create_resource(PathBuf::from(JAIL_MEM_OUT), ResourceType::Produced)
         .map_err(|e| OpError::vmm(format!("create_resource(mem_out): {e:?}")))?;
 
+    let mut spans = CaptureSpans::default();
+    let t_total = std::time::Instant::now();
+    let t_fc = std::time::Instant::now();
     let snapshot = vm
         .create_snapshot(CreateSnapshot {
             snapshot_type: Some(snapshot_type),
@@ -1003,6 +1006,7 @@ async fn snapshot_into_frame(
         })
         .await
         .map_err(|e| OpError::vmm(format!("create_snapshot: {e:?}")))?;
+    spans.fc_ms = t_fc.elapsed().as_millis() as u64;
 
     let (id, dir) = store.allocate().map_err(OpError::io)?;
     // Until `finalize` registers the frame, the directory is unreachable by
@@ -1050,9 +1054,15 @@ async fn snapshot_into_frame(
             (tree, None)
         }
         FrameInputs::Parent(parent) => {
-            let tree = diff_ingest(store.cas(), parent, &snapshot.mem_file_path, &child_mem)
-                .await
-                .map_err(OpError::io)?;
+            let tree = diff_ingest(
+                store.cas(),
+                parent,
+                &snapshot.mem_file_path,
+                &child_mem,
+                &mut spans,
+            )
+            .await
+            .map_err(OpError::io)?;
             (tree, Some(parent.id.clone()))
         }
     };
@@ -1060,6 +1070,7 @@ async fn snapshot_into_frame(
     // Artifact hashes: a step inherits kernel/initrd/store_disk/cmdline from
     // its parent (byte-identical down a lineage); only the fresh snapshot is
     // hashed. A seed hashes all five, once.
+    let t_art = std::time::Instant::now();
     let snapshot_hash = hash_file(dir.join("snapshot")).await.map_err(OpError::io)?;
     let artifacts = match &inputs {
         FrameInputs::Fresh(_) => ArtifactHashes {
@@ -1074,6 +1085,8 @@ async fn snapshot_into_frame(
             ..parent.artifacts
         },
     };
+
+    spans.art_ms = t_art.elapsed().as_millis() as u64;
 
     // The durability event: everything the central store lacks for this frame
     // (pages, tree nodes, artifacts) plus its record land durably BEFORE the
@@ -1090,10 +1103,20 @@ async fn snapshot_into_frame(
     )
     .await
     .map_err(OpError::io)?;
+    spans.commit_ms = tc.elapsed().as_millis() as u64;
     tracing::info!(
         frame = %id, uploaded_blobs = uploaded,
-        commit_ms = tc.elapsed().as_millis() as u64,
+        commit_ms = spans.commit_ms,
         "central commit OK — frame durable"
+    );
+
+    tracing::info!(
+        frame = %id,
+        fc = spans.fc_ms, copy = spans.copy_ms, patch = spans.patch_ms,
+        update = spans.update_ms, art = spans.art_ms, commit = spans.commit_ms,
+        dirty_pages = spans.dirty_pages,
+        total = t_total.elapsed().as_millis() as u64,
+        "capture spans"
     );
 
     store.finalize(id.clone(), dir, mem_tree, artifacts).await;
@@ -1220,11 +1243,25 @@ async fn ingest_full(cas: &store::LocalCas, mem_path: &Path) -> std::io::Result<
 /// pages. We (a) materialize the child's full on-disk mem = parent's mem +
 /// those dirty pages, so restore still loads a complete file, and (b) ingest
 /// the tree by `update`-ing the parent's tree with just the dirty pages.
+/// Per-component timings of a step capture, logged as one greppable line —
+/// the ruler every latency change is measured against (work.md §11).
+#[derive(Debug, Clone, Copy, Default)]
+struct CaptureSpans {
+    fc_ms: u64,
+    copy_ms: u64,
+    patch_ms: u64,
+    update_ms: u64,
+    art_ms: u64,
+    commit_ms: u64,
+    dirty_pages: u64,
+}
+
 async fn diff_ingest(
     cas: &store::LocalCas,
     parent: &Frame,
     diff_mem_path: &Path,
     child_mem: &Path,
+    spans: &mut CaptureSpans,
 ) -> std::io::Result<MemTree> {
     let diff_size = tokio::fs::metadata(diff_mem_path).await?.len();
 
@@ -1281,6 +1318,10 @@ async fn diff_ingest(
         copy_ms, patch_ms, update_ms,
         "diff ingest OK — O(dirty)"
     );
+    spans.copy_ms = copy_ms;
+    spans.patch_ms = patch_ms;
+    spans.update_ms = update_ms;
+    spans.dirty_pages = dirty_pages as u64;
 
     // Measurement (CRADLE_RECONSTRUCT_TEST): rebuild the just-captured child
     // image purely from the parent's image (reflink-by-content) + the CAS

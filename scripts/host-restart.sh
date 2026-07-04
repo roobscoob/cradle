@@ -25,11 +25,16 @@ STORE_MNT="${CRADLE_STORE_MNT:-/mnt/cradle}"
 # On kokuzo, $HOME rides the tank pool — spinning rust, but commits are
 # sequential pack writes sized by the dirty set, which tank handles fine.
 CENTRAL="${CRADLE_CENTRAL_STORE:-$HOME/cradle-central}"
+OUT_MNT="${CRADLE_JAIL_OUT:-/mnt/cradle-out}"
 BIN="$DIR/target/debug/host"
 UNIT=cradle-host
 
 [ -x "$BIN" ] || { echo "no host binary at $BIN — run 'just build' first" >&2; exit 1; }
 mountpoint -q "$STORE_MNT" || { echo "$STORE_MNT not mounted — run 'just store-setup' first" >&2; exit 1; }
+mountpoint -q "$OUT_MNT" || { echo "$OUT_MNT not mounted — run 'just store-setup' first" >&2; exit 1; }
+# Scratch from ops that died with a previous host (bind mounts died with
+# that unit's private mount namespace; only the dirs linger).
+rm -rf "${OUT_MNT:?}"/* 2>/dev/null || true
 
 TS_IP="$(tailscale ip -4 | head -n1)"
 [ -n "$TS_IP" ] || { echo "no tailscale IPv4 address?" >&2; exit 1; }
@@ -51,6 +56,7 @@ sudo systemd-run --unit="$UNIT" --collect --quiet \
   -p MemoryMax=24G -p MemorySwapMax=0 -p TasksMax=4096 -p CPUQuota=2000% \
   -p ProtectSystem=strict \
   -p ReadWritePaths="$STORE_MNT" \
+  -p ReadWritePaths="$OUT_MNT" \
   -p ReadWritePaths="$CENTRAL" \
   -p ReadWritePaths=/nix/var/nix/daemon-socket \
   -p PrivateTmp=yes \
@@ -64,6 +70,7 @@ sudo systemd-run --unit="$UNIT" --collect --quiet \
   -E TMPDIR="$STORE_MNT" \
   -E CRADLE_BIND_ADDR="$TS_IP:$PORT" \
   -E CRADLE_CENTRAL_STORE="$CENTRAL" \
+  -E CRADLE_JAIL_OUT="$OUT_MNT" \
   "$BIN"
 
 echo ">> $UNIT started: http://$TS_IP:$PORT, frame store in $STORE_MNT"

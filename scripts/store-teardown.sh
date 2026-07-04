@@ -6,6 +6,8 @@ set -euo pipefail
 
 IMG="${CRADLE_STORE_IMG:-/mnt/cradle-backing/cradle-store.img}"
 MNT="${CRADLE_STORE_MNT:-/mnt/cradle}"
+OUT_IMG="${CRADLE_OUT_IMG:-/mnt/cradle-backing/cradle-out.img}"
+OUT_MNT="${CRADLE_JAIL_OUT:-/mnt/cradle-out}"
 
 if systemctl is-active --quiet cradle-host.service; then
   echo "cradle-host is running — stop it first (just stop)" >&2
@@ -15,6 +17,9 @@ fi
 if mountpoint -q "$MNT"; then
   sudo umount "$MNT"
 fi
-rm -f "$IMG"
-sudo rmdir "$MNT" 2>/dev/null || true
-echo ">> frame store gone ($IMG deleted)"
+if mountpoint -q "$OUT_MNT"; then
+  sudo umount "$OUT_MNT"
+fi
+rm -f "$IMG" "$OUT_IMG"
+sudo rmdir "$MNT" "$OUT_MNT" 2>/dev/null || true
+echo ">> frame store gone ($IMG + $OUT_IMG deleted)"

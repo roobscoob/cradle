@@ -93,7 +93,11 @@ async fn main() {
     // dirty-page extraction would silently zero clean pages in every child
     // frame (see ops::probe_store_fs / ops::read_dirty_pages). Also warns
     // once if reflink is unavailable (correct but O(image) captures).
-    ops::probe_store_fs(frames.root()).expect("frame store filesystem check");
+    ops::probe_store_fs(frames.root(), true).expect("frame store filesystem check");
+    // The jail-output scratch hosts Diff snapshot mem files, so it needs the
+    // same hole fidelity (read_dirty_pages runs against it) — but no reflink.
+    ops::probe_store_fs(ops::jail_out_root(), false)
+        .expect("jail-out scratch filesystem check");
     let state = Arc::new(http::AppState {
         installation: Arc::new(installation),
         frames,

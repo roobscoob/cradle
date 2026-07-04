@@ -87,8 +87,74 @@ const MEM_SIZE_MIB: usize = 1024;
 // per-op root and don't collide with each other.
 const JAIL_API_SOCKET: &str = "/api.sock";
 const JAIL_VSOCK_UDS: &str = "/vsock.sock";
-const JAIL_SNAP_OUT: &str = "/snap.out";
-const JAIL_MEM_OUT: &str = "/mem.out";
+// Snapshot outputs land on the jail-output scratch volume, bind-mounted at
+// `<jail>/out` per op (see JailOutMount). A plain fs (ext4) — fc's sparse
+// 4 KiB diff writes were paying btrfs CoW extent churn on the store volume.
+const JAIL_SNAP_OUT: &str = "/out/snap.out";
+const JAIL_MEM_OUT: &str = "/out/mem.out";
+
+/// Host-side root of the jail-output scratch volume (`CRADLE_JAIL_OUT`).
+pub fn jail_out_root() -> &'static Path {
+    static ROOT: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        std::env::var_os("CRADLE_JAIL_OUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/mnt/cradle-out"))
+    });
+    &ROOT
+}
+
+/// Per-op scratch dir on the jail-output volume, bind-mounted at
+/// `<jail>/out` so the chrooted firecracker can write its snapshot there.
+/// Unmounts (lazily) and removes the scratch on drop — every op exit path.
+/// The host's mount namespace is private to the systemd unit, so even a
+/// crashed host leaks nothing past the unit's lifetime; host-restart sweeps
+/// leftover scratch dirs.
+struct JailOutMount {
+    target: PathBuf,
+    scratch: PathBuf,
+}
+
+impl JailOutMount {
+    fn mount(jail_path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let jail_id = jail_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .ok_or_else(|| std::io::Error::other("jail path has no id component"))?;
+        let scratch = jail_out_root().join(jail_id);
+        std::fs::create_dir_all(&scratch)?;
+        let target = jail_path.join("out");
+        std::fs::create_dir_all(&target)?;
+        let src = std::ffi::CString::new(scratch.as_os_str().as_bytes())
+            .map_err(std::io::Error::other)?;
+        let tgt = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(std::io::Error::other)?;
+        let ret = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                tgt.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { target, scratch })
+    }
+}
+
+impl Drop for JailOutMount {
+    fn drop(&mut self) {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(tgt) = std::ffi::CString::new(self.target.as_os_str().as_bytes()) {
+            // Lazy detach: never blocks on a straggling open fd.
+            unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
+        }
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
 
 /// `VirtualPathResolver` that canonicalizes our artifact filenames before
 /// they're placed inside the jail. The default `FlatVirtualPathResolver`
@@ -247,6 +313,7 @@ pub async fn build_frame(
     let mut vm = Vm::prepare(executor, rs, (*installation).clone(), config)
         .await
         .map_err(|e| OpError::vmm(format!("Vm::prepare: {e:?}")))?;
+    let _out_mount = JailOutMount::mount(&jail_path).map_err(OpError::io)?;
 
     // From here on we own a live `vm`: every exit path must reach
     // `hard_kill` below (a leaked firecracker process pins its KVM fds and
@@ -449,6 +516,7 @@ pub async fn step_frame(
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "step_frame: Vm::prepare done"
     );
+    let _out_mount = JailOutMount::mount(&jail_path).map_err(OpError::io)?;
 
     // From here on we own a live `vm` — wrap everything in a `select!` against
     // cancel so a client disconnect always reaches `hard_kill` below.
@@ -1454,8 +1522,10 @@ fn read_dirty_pages(diff_path: &Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
 ///
 /// Soft requirement: reflink (FICLONE). Without it every capture degrades to
 /// a full image copy — correct but O(image); warn loudly once instead of
-/// per-op.
-pub fn probe_store_fs(root: &Path) -> std::io::Result<()> {
+/// per-op. `check_reflink: false` for volumes that only host snapshot
+/// outputs (the jail-out scratch is deliberately a plain fs — no clones
+/// happen there, so the warning would be noise).
+pub fn probe_store_fs(root: &Path, check_reflink: bool) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     // Hole probe: an ftruncate-extended file is all hole on any filesystem
@@ -1491,6 +1561,10 @@ pub fn probe_store_fs(root: &Path) -> std::io::Result<()> {
     }
 
     // Reflink probe: performance only, warn instead of fail.
+    if !check_reflink {
+        tracing::info!("fs probe OK at {}: holes reported (reflink not required here)", root.display());
+        return Ok(());
+    }
     let src = root.join(".fs-probe-reflink-src");
     let dst = root.join(".fs-probe-reflink-dst");
     let reflinked = std::fs::write(&src, [0u8; 16]).and_then(|()| reflink_or_copy(&src, &dst));

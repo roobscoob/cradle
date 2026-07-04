@@ -1035,6 +1035,15 @@ async fn snapshot_into_frame(
             // Full snapshot: mem_out is the complete image. Copy it in and
             // build the whole page-tree (hashing pages; storing only nodes).
             copy(&snapshot.mem_file_path, &child_mem).await?;
+            // Flush the 1 GiB copy NOW, on the build's own clock: left
+            // buffered, it becomes write-back debt and balance_dirty_pages
+            // throttles the next writer on this volume — the first step
+            // after a build paid ~4s of stalls for it.
+            let cm = child_mem.clone();
+            tokio::task::spawn_blocking(move || std::fs::File::open(&cm)?.sync_data())
+                .await
+                .map_err(|e| OpError::io(std::io::Error::other(format!("sync join: {e}"))))?
+                .map_err(OpError::io)?;
             let tree = ingest_full(store.cas(), &child_mem)
                 .await
                 .map_err(OpError::io)?;

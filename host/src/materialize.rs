@@ -238,6 +238,17 @@ pub async fn materialize_fetch<C: Cas>(
         .await
         .map_err(|e| io::Error::other(format!("gap write join: {e}")))??;
     }
+
+    // Pay for our own writes before handing the frame over: a cold fetch can
+    // buffer a gigabyte of gap fills, and left unflushed that debt throttles
+    // the NEXT writer on the volume (the first step after a fetch inherited
+    // seconds of balance_dirty_pages stalls from it).
+    {
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(&dest)?.sync_data())
+            .await
+            .map_err(|e| io::Error::other(format!("sync join: {e}")))??;
+    }
     Ok((cloned_pages, fetched_pages))
 }
 

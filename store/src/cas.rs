@@ -16,7 +16,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 /// A 256-bit `blake3` content hash. This is the address of a blob.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash, Serialize, Deserialize)]
+///
+/// Serde: hex string in human-readable formats (JSON frame records), raw
+/// 32 bytes in compact ones (postcard tree nodes — encoding-identical to the
+/// old derive, so node hashes are unchanged).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
 pub struct Hash([u8; 32]);
 
 impl Hash {
@@ -26,8 +30,44 @@ impl Hash {
         Hash(blake3::hash(bytes).into())
     }
 
+    /// Wrap an already-computed blake3 digest (e.g. from an incremental
+    /// `blake3::Hasher` over streamed bytes).
+    pub fn from_bytes(bytes: [u8; 32]) -> Hash {
+        Hash(bytes)
+    }
+
+    /// Hash a stream without holding it in memory (whole-file artifacts).
+    /// Blocking I/O — call from a blocking context.
+    pub fn of_reader(reader: &mut impl std::io::Read) -> io::Result<Hash> {
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Hash(hasher.finalize().into()))
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Parse the `to_hex` form back. Errors on anything but 64 hex chars.
+    pub fn from_hex(s: &str) -> Result<Hash, String> {
+        let b = s.as_bytes();
+        if b.len() != 64 {
+            return Err(format!("hash hex must be 64 chars, got {}", b.len()));
+        }
+        let mut out = [0u8; 32];
+        for (i, chunk) in b.chunks(2).enumerate() {
+            let hi = hex_val(chunk[0]).ok_or_else(|| format!("bad hex at {}", i * 2))?;
+            let lo = hex_val(chunk[1]).ok_or_else(|| format!("bad hex at {}", i * 2 + 1))?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Hash(out))
     }
 
     /// Lowercase hex, 64 chars. Used for on-disk paths and logging.
@@ -45,6 +85,39 @@ fn hex_digit(nibble: u8) -> char {
     match nibble {
         0..=9 => (b'0' + nibble) as char,
         _ => (b'a' + (nibble - 10)) as char,
+    }
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl Serialize for Hash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.collect_str(self)
+        } else {
+            // Mirrors the old derive exactly: newtype struct over [u8; 32],
+            // which postcard encodes as 32 raw bytes. Node blob hashes must
+            // not change under a serde refactor.
+            s.serialize_newtype_struct("Hash", &self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            Hash::from_hex(&s).map_err(serde::de::Error::custom)
+        } else {
+            <[u8; 32]>::deserialize(d).map(Hash)
+        }
     }
 }
 
@@ -82,8 +155,16 @@ pub trait Cas: Send + Sync {
     fn has(&self, hash: &Hash) -> impl Future<Output = io::Result<bool>> + Send;
 }
 
-/// Filesystem-backed CAS. Blobs live at `<root>/<aa>/<bb>/<full-hex>`, a
-/// two-level fan-out so no single directory holds millions of entries.
+/// Filesystem-backed CAS for the *scratch* tier: blobs live at
+/// `<root>/<aa>/<bb>/<full-hex>`, a two-level fan-out so no single directory
+/// holds millions of entries.
+///
+/// Never fsyncs. This tier is disposable by doctrine — the host's store is
+/// wiped on every start and anything that must survive a crash lives in the
+/// central store (which stores packs, not per-blob files, precisely because
+/// per-blob durability costs one device round-trip per blob). After a crash
+/// this CAS may hold torn blobs; the only correct response is to discard the
+/// tier, which is what happens anyway.
 pub struct LocalCas {
     root: PathBuf,
 }
@@ -136,18 +217,16 @@ impl Cas for LocalCas {
             .expect("blob path always has a parent directory");
         tokio::fs::create_dir_all(dir).await?;
 
-        // Write to a unique temp file, then rename into place so a reader never
-        // observes a half-written blob. fsync before the rename: on many
-        // filesystems a rename can be persisted before the data it points at,
-        // so a crash could otherwise leave a durable-but-empty blob that `has`
-        // reports present and `get` serves corrupt — permanently, since a CAS
-        // never re-fetches a hash it believes it holds.
+        // Write to a unique temp file, then rename into place so a concurrent
+        // reader never observes a half-written blob. No fsync: a crash may
+        // leave a renamed-but-torn blob, which is fine ONLY because this tier
+        // is discarded wholesale on restart (see the type-level doc). Don't
+        // point a LocalCas at anything that outlives the process.
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".tmp.{}.{seq}", std::process::id()));
         let mut guard = TmpGuard(Some(tmp.clone()));
         let mut f = tokio::fs::File::create(&tmp).await?;
         f.write_all(bytes).await?;
-        f.sync_data().await?;
         drop(f);
         match tokio::fs::rename(&tmp, &path).await {
             Ok(()) => guard.disarm(),

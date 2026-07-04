@@ -15,7 +15,10 @@ const FIRECRACKER_BIN: &str = env!("FIRECRACKER_BIN");
 const JAILER_BIN: &str = env!("JAILER_BIN");
 const SNAPSHOT_EDITOR_BIN: &str = env!("SNAPSHOT_EDITOR_BIN");
 
-const BIND_ADDR: &str = "0.0.0.0:8080";
+/// Default bind address; override with `CRADLE_BIND_ADDR` to pin the API to
+/// one interface (e.g. a tailnet IP on a host that must not expose it to the
+/// LAN).
+const BIND_ADDR_DEFAULT: &str = "0.0.0.0:8080";
 
 #[tokio::main]
 async fn main() {
@@ -66,7 +69,26 @@ async fn main() {
         artifacts.agent_static.display()
     );
 
-    let frames = frame::FrameStore::new().expect("create FrameStore");
+    // The central (durable) store: REQUIRED. A frame id is a durability
+    // promise — there is deliberately no local-only mode to accidentally
+    // develop against (see store::central).
+    let central_path = std::env::var("CRADLE_CENTRAL_STORE").expect(
+        "CRADLE_CENTRAL_STORE must point at the central store directory \
+         (the durable tier frame ids are committed to before they're returned)",
+    );
+    let central: std::sync::Arc<dyn store::ContentStore> = std::sync::Arc::new(
+        store::DirStore::open(&central_path)
+            .unwrap_or_else(|e| panic!("open central store {central_path}: {e}")),
+    );
+    match central.list_frames().await {
+        Ok(ids) => tracing::info!(
+            "central store at {central_path}: {} frame(s) available",
+            ids.len()
+        ),
+        Err(e) => panic!("central store at {central_path} unusable: {e}"),
+    }
+
+    let frames = frame::FrameStore::new(central).expect("create FrameStore");
     // Refuse to run on a filesystem that can't report holes: Diff-snapshot
     // dirty-page extraction would silently zero clean pages in every child
     // frame (see ops::probe_store_fs / ops::read_dirty_pages). Also warns
@@ -80,10 +102,12 @@ async fn main() {
 
     let app = http::router(state);
 
-    let listener = tokio::net::TcpListener::bind(BIND_ADDR)
+    let bind_addr =
+        std::env::var("CRADLE_BIND_ADDR").unwrap_or_else(|_| BIND_ADDR_DEFAULT.into());
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .unwrap_or_else(|e| panic!("bind {BIND_ADDR}: {e}"));
+        .unwrap_or_else(|e| panic!("bind {bind_addr}: {e}"));
 
-    tracing::info!("cradle listening on http://{BIND_ADDR}");
+    tracing::info!("cradle listening on http://{bind_addr}");
     axum::serve(listener, app).await.expect("axum serve");
 }

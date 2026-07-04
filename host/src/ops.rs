@@ -46,11 +46,11 @@ use tokio::{
 };
 use ulid::Ulid;
 
-use store::MemTree;
+use store::{BlobSrc, Cas, ContentStore, Hash, MemTree};
 
 use crate::{
     agent_link::AgentLink,
-    frame::{Frame, FrameId, FrameStore},
+    frame::{ArtifactHashes, Frame, FrameId, FrameStore},
     nix_build::ServerArtifacts,
     user_flake::{UserArtifacts, build_user_artifacts},
 };
@@ -1030,25 +1030,159 @@ async fn snapshot_into_frame(
     reflink_or_copy_quiet(snapshot.snapshot_path.clone(), dir.join("snapshot")).await?;
 
     let child_mem = dir.join("mem");
-    let mem_tree = match inputs {
+    let (mem_tree, parent_id) = match &inputs {
         FrameInputs::Fresh(_) => {
             // Full snapshot: mem_out is the complete image. Copy it in and
-            // build the whole page-tree.
+            // build the whole page-tree (hashing pages; storing only nodes).
             copy(&snapshot.mem_file_path, &child_mem).await?;
-            ingest_full(store.cas(), &child_mem)
+            let tree = ingest_full(store.cas(), &child_mem)
                 .await
-                .map_err(OpError::io)?
+                .map_err(OpError::io)?;
+            (tree, None)
         }
         FrameInputs::Parent(parent) => {
-            diff_ingest(store.cas(), parent, &snapshot.mem_file_path, &child_mem)
+            let tree = diff_ingest(store.cas(), parent, &snapshot.mem_file_path, &child_mem)
                 .await
-                .map_err(OpError::io)?
+                .map_err(OpError::io)?;
+            (tree, Some(parent.id.clone()))
         }
     };
 
-    store.finalize(id.clone(), dir, mem_tree).await;
+    // Artifact hashes: a step inherits kernel/initrd/store_disk/cmdline from
+    // its parent (byte-identical down a lineage); only the fresh snapshot is
+    // hashed. A seed hashes all five, once.
+    let snapshot_hash = hash_file(dir.join("snapshot")).await.map_err(OpError::io)?;
+    let artifacts = match &inputs {
+        FrameInputs::Fresh(_) => ArtifactHashes {
+            kernel: hash_file(dir.join("kernel")).await.map_err(OpError::io)?,
+            initrd: hash_file(dir.join("initrd")).await.map_err(OpError::io)?,
+            store_disk: hash_file(dir.join("store_disk")).await.map_err(OpError::io)?,
+            cmdline: hash_file(dir.join("cmdline")).await.map_err(OpError::io)?,
+            snapshot: snapshot_hash,
+        },
+        FrameInputs::Parent(parent) => ArtifactHashes {
+            snapshot: snapshot_hash,
+            ..parent.artifacts
+        },
+    };
+
+    // The durability event: everything the central store lacks for this frame
+    // (pages, tree nodes, artifacts) plus its record land durably BEFORE the
+    // id exists anywhere. A frame id is a promise any machine can cash.
+    let tc = std::time::Instant::now();
+    let uploaded = commit_frame_central(
+        store,
+        &id,
+        parent_id.as_ref(),
+        &mem_tree,
+        &dir,
+        &child_mem,
+        &artifacts,
+    )
+    .await
+    .map_err(OpError::io)?;
+    tracing::info!(
+        frame = %id, uploaded_blobs = uploaded,
+        commit_ms = tc.elapsed().as_millis() as u64,
+        "central commit OK — frame durable"
+    );
+
+    store.finalize(id.clone(), dir, mem_tree, artifacts).await;
     dir_guard.0 = None;
     Ok(id)
+}
+
+/// Assemble and durably commit everything the central store is missing for
+/// this frame. The want/have runs over the mem tree (`diff_between` prunes
+/// every subtree the store already holds), pages upload as ranges of the
+/// child's mem image, nodes from the scratch CAS, artifacts as whole files.
+/// Returns the number of blobs uploaded.
+async fn commit_frame_central(
+    store: &FrameStore,
+    id: &FrameId,
+    parent: Option<&FrameId>,
+    mem_tree: &MemTree,
+    dir: &Path,
+    child_mem: &Path,
+    artifacts: &ArtifactHashes,
+) -> std::io::Result<u64> {
+    let central = store.central();
+    let page = store::memtree::PAGE as u64;
+
+    let holder = HolderShim(central.as_ref());
+    let d = store::memtree::diff_between(store.cas(), &holder, mem_tree).await?;
+
+    // A tree repeats content (zero pages above all): dedup so each blob is
+    // packed once. DirStore also guards, but don't ship duplicates at all.
+    let mut seen = std::collections::HashSet::new();
+    let mut blobs: Vec<(Hash, BlobSrc)> = Vec::new();
+    for m in &d.missing {
+        if !seen.insert(m.hash) {
+            continue;
+        }
+        if m.level == 0 {
+            let offset = m.page_base * page;
+            let len = page.min(mem_tree.len - offset);
+            blobs.push((
+                m.hash,
+                BlobSrc::FileRange {
+                    path: child_mem.to_path_buf(),
+                    offset,
+                    len,
+                },
+            ));
+        } else {
+            blobs.push((m.hash, BlobSrc::Mem(store.cas().get(&m.hash).await?)));
+        }
+    }
+
+    let art = [
+        (artifacts.kernel, "kernel"),
+        (artifacts.initrd, "initrd"),
+        (artifacts.store_disk, "store_disk"),
+        (artifacts.cmdline, "cmdline"),
+        (artifacts.snapshot, "snapshot"),
+    ];
+    let art_hashes: Vec<Hash> = art.iter().map(|&(h, _)| h).collect();
+    let art_missing = central.missing(&art_hashes).await?;
+    for (hash, name) in art {
+        if art_missing.contains(&hash) && seen.insert(hash) {
+            let path = dir.join(name);
+            let len = tokio::fs::metadata(&path).await?.len();
+            blobs.push((hash, BlobSrc::FileRange { path, offset: 0, len }));
+        }
+    }
+
+    let uploaded = blobs.len() as u64;
+    let record = FrameStore::record(id, parent, mem_tree, artifacts);
+    central.commit(blobs, Some(&record)).await?;
+    Ok(uploaded)
+}
+
+/// `Cas` adapter over the central store for `diff_between`'s holder side —
+/// only `has` is ever called there (the src side supplies node bytes).
+struct HolderShim<'a>(&'a dyn ContentStore);
+
+impl Cas for HolderShim<'_> {
+    async fn put(&self, _bytes: &[u8]) -> std::io::Result<Hash> {
+        Err(std::io::Error::other("HolderShim is has-only"))
+    }
+    async fn get(&self, _hash: &Hash) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("HolderShim is has-only"))
+    }
+    async fn has(&self, hash: &Hash) -> std::io::Result<bool> {
+        self.0.has(hash).await
+    }
+}
+
+/// Streaming blake3 of a file, off the async threads.
+async fn hash_file(path: PathBuf) -> std::io::Result<Hash> {
+    tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::File::open(&path)?;
+        Hash::of_reader(&mut f)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("hash join: {e}")))?
 }
 
 /// Removes an allocated-but-not-finalized frame directory on drop. Disarm by
@@ -1063,10 +1197,11 @@ impl Drop for FrameDirGuard {
     }
 }
 
-/// Fresh-build ingest: build the whole page-tree from the full mem image.
+/// Fresh-build ingest: hash every page of the full mem image into a tree,
+/// storing only inner nodes — the image itself is the page-byte store.
 async fn ingest_full(cas: &store::LocalCas, mem_path: &Path) -> std::io::Result<MemTree> {
     let t0 = std::time::Instant::now();
-    let tree = store::memtree::build_from_path(cas, mem_path).await?;
+    let tree = store::memtree::build_nodes_from_path(cas, mem_path).await?;
     let build_ms = t0.elapsed().as_millis() as u64;
     tracing::info!(mem_root = %tree.root, mem_len = tree.len, build_ms, "build ingest OK");
     Ok(tree)
@@ -1114,8 +1249,22 @@ async fn diff_ingest(
     let dirty_pages = dirty.len();
     let patch_ms = t0.elapsed().as_millis() as u64 - copy_ms;
 
+    // Hash the dirty pages (CPU, blocking pool) and rebuild only the tree
+    // paths — page bytes are never stored as blobs; they already live in the
+    // child image the patch step just wrote.
     let tu = std::time::Instant::now();
-    let tree = store::memtree::update(cas, &parent.mem_tree, dirty).await?;
+    let (dirty, leaves) = tokio::task::spawn_blocking(
+        move || -> (Vec<(u64, Vec<u8>)>, Vec<(u64, store::Hash)>) {
+            let leaves = dirty
+                .iter()
+                .map(|(p, b)| (*p, store::Hash::of(b)))
+                .collect();
+            (dirty, leaves)
+        },
+    )
+    .await
+    .map_err(|e| std::io::Error::other(format!("hash join: {e}")))?;
+    let tree = store::memtree::update_hashes(cas, &parent.mem_tree, leaves).await?;
     let update_ms = tu.elapsed().as_millis() as u64;
 
     tracing::info!(
@@ -1137,8 +1286,17 @@ async fn diff_ingest(
         index.add_image(cas, parent.mem(), &parent.mem_tree).await?;
         let index_ms = ti.elapsed().as_millis() as u64;
 
+        // Pages aren't CAS blobs anymore; serve this capture's dirty pages
+        // from memory so the gap-fill (the network stand-in) still resolves.
+        let overlay = DirtyOverlay {
+            inner: cas,
+            pages: dirty
+                .iter()
+                .map(|(_, b)| (store::Hash::of(b), b.clone()))
+                .collect(),
+        };
         let recon = child_mem.with_extension("recon");
-        match crate::materialize::reconstruct(cas, &tree, &index, &recon).await {
+        match crate::materialize::reconstruct(&overlay, &tree, &index, &recon).await {
             Ok(s) => {
                 let recon_ok = files_equal(child_mem, &recon).await.unwrap_or(false);
                 tracing::info!(
@@ -1153,6 +1311,32 @@ async fn diff_ingest(
     }
 
     Ok(tree)
+}
+
+/// `Cas` overlay for the reconstruct measurement: dirty pages resolve from
+/// memory (they're no longer stored as blobs), everything else (tree nodes)
+/// falls through to the scratch CAS.
+struct DirtyOverlay<'a> {
+    inner: &'a store::LocalCas,
+    pages: std::collections::HashMap<Hash, Vec<u8>>,
+}
+
+impl Cas for DirtyOverlay<'_> {
+    async fn put(&self, bytes: &[u8]) -> std::io::Result<Hash> {
+        self.inner.put(bytes).await
+    }
+    async fn get(&self, hash: &Hash) -> std::io::Result<Vec<u8>> {
+        if let Some(b) = self.pages.get(hash) {
+            return Ok(b.clone());
+        }
+        self.inner.get(hash).await
+    }
+    async fn has(&self, hash: &Hash) -> std::io::Result<bool> {
+        if self.pages.contains_key(hash) {
+            return Ok(true);
+        }
+        self.inner.has(hash).await
+    }
 }
 
 /// Walk a sparse Diff-snapshot mem file with SEEK_DATA/SEEK_HOLE to find the

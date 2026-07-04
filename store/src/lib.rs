@@ -17,7 +17,9 @@
 //! drives a local filesystem store today and a remote object store later.
 
 pub mod cas;
+pub mod central;
 pub mod memtree;
 
 pub use cas::{Cas, Hash, LocalCas};
+pub use central::{BlobSrc, ContentStore, DirStore, FrameRecord};
 pub use memtree::MemTree;

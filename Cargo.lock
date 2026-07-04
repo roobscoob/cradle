@@ -2503,6 +2503,7 @@ dependencies = [
  "futures-util",
  "postcard",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

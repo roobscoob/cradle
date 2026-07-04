@@ -147,6 +147,44 @@ where
     fold_to_root(cas, level, total).await
 }
 
+/// [`build_from_reader`] minus page storage: streams the image, hashes each
+/// page, and writes only the inner nodes to `cas`. Produces the identical
+/// tree. This is the capture-path builder under the pages-live-in-images
+/// doctrine: the image file itself remains the page-byte source (located via
+/// the content index), so storing page blobs would duplicate every byte.
+pub async fn build_nodes_from_reader<C, R>(cas: &C, reader: &mut R) -> io::Result<MemTree>
+where
+    C: Cas,
+    R: AsyncRead + Unpin,
+{
+    let mut level: Vec<Hash> = Vec::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; PAGE * READ_BATCH];
+    loop {
+        let filled = read_full(reader, &mut buf).await?;
+        if filled == 0 {
+            break;
+        }
+        total += filled as u64;
+        for page in buf[..filled].chunks(PAGE) {
+            level.push(Hash::of(page));
+        }
+        if filled < buf.len() {
+            break; // short read → EOF
+        }
+    }
+    fold_to_root(cas, level, total).await
+}
+
+/// Convenience wrapper around [`build_nodes_from_reader`] for a file path.
+pub async fn build_nodes_from_path<C: Cas>(
+    cas: &C,
+    path: impl AsRef<std::path::Path>,
+) -> io::Result<MemTree> {
+    let mut file = tokio::fs::File::open(path).await?;
+    build_nodes_from_reader(cas, &mut file).await
+}
+
 /// Fill `buf` from `reader` across short reads; returns bytes read (0 at EOF).
 async fn read_full<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
@@ -300,6 +338,48 @@ where
     leaves.sort_by_key(|&(page, _)| page);
 
     let h = height(page_count(parent.len));
+    let root = rebuild(cas, h, parent.root, 0, &leaves).await?;
+    Ok(MemTree {
+        root,
+        len: parent.len,
+    })
+}
+
+/// [`update`] for callers that already hold the dirty pages' hashes and keep
+/// the bytes elsewhere (the frame's mem image): rebuilds the root-to-leaf
+/// paths writing only the rewritten inner nodes to `cas` — page bytes are
+/// never stored. The capture-path entry point under the pages-live-in-images
+/// doctrine; [`update`] remains for whole-blob stores (tests, tooling).
+///
+/// The caller vouches that each hash is the blake3 of that page's exact bytes
+/// (a short final page hashes its short slice, same as [`build`]).
+pub async fn update_hashes<C: Cas>(
+    cas: &C,
+    parent: &MemTree,
+    dirty: Vec<(u64, Hash)>,
+) -> io::Result<MemTree> {
+    if dirty.is_empty() {
+        return Ok(*parent);
+    }
+    let pages = page_count(parent.len);
+    if pages == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dirty pages supplied for a zero-length parent image",
+        ));
+    }
+    for &(page, _) in &dirty {
+        if page >= pages {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dirty page {page} out of range (parent has {pages} pages)"),
+            ));
+        }
+    }
+    let mut leaves = dirty;
+    // Stable, so a page supplied twice keeps last-write-wins (same as update).
+    leaves.sort_by_key(|&(page, _)| page);
+    let h = height(pages);
     let root = rebuild(cas, h, parent.root, 0, &leaves).await?;
     Ok(MemTree {
         root,
@@ -571,6 +651,53 @@ fn plan_node<'a, C: Cas, L: Locate>(
         }
         Ok(ops)
     })
+}
+
+/// Ensure every *inner node* of `tree` is present in `cas`, fetching missing
+/// ones from `store` level by level — one batched `get_blobs` per level, so a
+/// cold tree costs `height` round trips, not one per node. Leaves are never
+/// fetched here: page bytes come from images (clone) or the materialize gap
+/// path. Returns how many nodes were fetched.
+pub async fn fetch_nodes<C: Cas>(
+    cas: &C,
+    store: &dyn crate::central::ContentStore,
+    tree: &MemTree,
+) -> io::Result<u64> {
+    let mut level = height(page_count(tree.len));
+    let mut level_hashes = vec![tree.root];
+    let mut fetched = 0u64;
+    loop {
+        let mut seen = std::collections::HashSet::new();
+        let mut missing: Vec<Hash> = Vec::new();
+        for h in &level_hashes {
+            if seen.insert(*h) && !cas.has(h).await? {
+                missing.push(*h);
+            }
+        }
+        if !missing.is_empty() {
+            let blobs = store.get_blobs(&missing).await?;
+            for (h, b) in missing.iter().zip(&blobs) {
+                // Never trust wire bytes without checking their name.
+                if Hash::of(b) != *h {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("fetched node {h} hashes to {}", Hash::of(b)),
+                    ));
+                }
+                cas.put(b).await?;
+                fetched += 1;
+            }
+        }
+        if level == 1 {
+            return Ok(fetched);
+        }
+        let mut next = Vec::new();
+        for h in &level_hashes {
+            next.extend(decode_node(&cas.get(h).await?)?);
+        }
+        level_hashes = next;
+        level -= 1;
+    }
 }
 
 /// Enumerate every blob of `tree` with where it sits: `(hash, level, page_base)`
@@ -1393,6 +1520,57 @@ mod tests {
         let handle = tokio::spawn(async move { plan_materialize(&*cas, &tree, &*loc).await });
         let plan = handle.await.unwrap().unwrap();
         assert_eq!(plan.len(), 10);
+    }
+
+    /// The nodes-only builders must produce byte-identical trees to their
+    /// page-storing twins while writing only inner nodes to the CAS — the
+    /// step-1 contract: page bytes live in images, never as blobs.
+    #[tokio::test]
+    async fn nodes_only_builders_match_and_store_no_pages() {
+        // 130 full pages + a short tail page → exercises the short-leaf hash.
+        let data = pseudo(3, 130 * PAGE + 100);
+        let n_pages = page_count(data.len() as u64) as usize;
+
+        let full = MemCas::default();
+        let nodes = MemCas::default();
+        let t_full = build(&full, &data).await.unwrap();
+        let t_nodes = build_nodes_from_reader(&nodes, &mut &data[..])
+            .await
+            .unwrap();
+        assert_eq!(t_full, t_nodes, "hash-only build must match page-storing build");
+        assert!(
+            nodes.writes() < n_pages,
+            "nodes-only build wrote {} blobs for {} pages — pages are leaking into the CAS",
+            nodes.writes(),
+            n_pages
+        );
+        // No leaf blob is fetchable from the nodes-only CAS.
+        let leaf0 = Hash::of(&data[..PAGE]);
+        assert!(!nodes.has(&leaf0).await.unwrap());
+
+        // update vs update_hashes: same dirty pages, same resulting root.
+        let dirty: Vec<(u64, Vec<u8>)> = vec![
+            (2, pseudo(9, PAGE)),
+            (77, pseudo(11, PAGE)),
+            (n_pages as u64 - 1, pseudo(13, 100)), // short final page
+        ];
+        let t2_full = update(&full, &t_full, dirty.clone()).await.unwrap();
+        let leaves: Vec<(u64, Hash)> = dirty
+            .iter()
+            .map(|(p, b)| (*p, Hash::of(b)))
+            .collect();
+        let t2_nodes = update_hashes(&nodes, &t_nodes, leaves).await.unwrap();
+        assert_eq!(
+            t2_full, t2_nodes,
+            "update_hashes must produce the identical tree to update"
+        );
+
+        // Out-of-range page index must be rejected.
+        let bad = update_hashes(&nodes, &t_nodes, vec![(n_pages as u64, Hash::of(b"x"))]).await;
+        assert!(bad.is_err());
+        // Empty dirty set is the parent, unchanged.
+        let same = update_hashes(&nodes, &t_nodes, Vec::new()).await.unwrap();
+        assert_eq!(same, t_nodes);
     }
 
     #[tokio::test]

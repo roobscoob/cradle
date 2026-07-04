@@ -169,6 +169,78 @@ fn clone_range(
     Ok(())
 }
 
+/// Materialize `tree`'s image into `dest` with the network in the loop:
+/// locally-held content is cloned by reflink (via `index`), and every `Gap`
+/// is batch-fetched from `central` — work.md §7's "Gap ops → filled by the
+/// store's patch stream". Gap fetches run in bounded waves so a fully-cold
+/// image (a seed restored on a fresh machine) never buffers more than
+/// [`GAP_BATCH_PAGES`] pages in memory.
+///
+/// Returns `(cloned_pages, fetched_pages)`.
+pub async fn materialize_fetch<C: Cas>(
+    nodes: &C,
+    tree: &MemTree,
+    index: &LocalIndex,
+    central: &dyn store::ContentStore,
+    dest: &Path,
+) -> io::Result<(u64, u64)> {
+    /// 16k pages = 64 MiB per fetch wave.
+    const GAP_BATCH_PAGES: usize = 16 * 1024;
+
+    let page = memtree::PAGE as u64;
+    let plan = memtree::plan_materialize(nodes, tree, index).await?;
+
+    let mut clones: Vec<Op<u32>> = Vec::new();
+    let mut gaps: Vec<(Hash, u64)> = Vec::new(); // (hash, byte offset)
+    let mut cloned_pages = 0u64;
+    for op in &plan {
+        match *op {
+            Op::Clone { pages, .. } => {
+                cloned_pages += pages;
+                clones.push(*op);
+            }
+            Op::Gap {
+                hash,
+                dest_page_base,
+                ..
+            } => gaps.push((hash, dest_page_base * page)),
+        }
+    }
+
+    // Clones first — this also creates `dest` and sets its (sparse) length,
+    // so the gap waves below only ever pwrite into an existing file.
+    {
+        let images = index.images.clone();
+        let dest = dest.to_path_buf();
+        let len = tree.len;
+        tokio::task::spawn_blocking(move || execute_plan(&clones, &images, &dest, len))
+            .await
+            .map_err(|e| io::Error::other(format!("materialize clones join: {e}")))??;
+    }
+
+    let fetched_pages = gaps.len() as u64;
+    for wave in gaps.chunks(GAP_BATCH_PAGES) {
+        let hashes: Vec<Hash> = wave.iter().map(|&(h, _)| h).collect();
+        let bytes = central.get_blobs(&hashes).await?;
+        let writes: Vec<(u64, Vec<u8>)> = wave
+            .iter()
+            .map(|&(_, off)| off)
+            .zip(bytes)
+            .collect();
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let f = std::fs::OpenOptions::new().write(true).open(&dest)?;
+            for (off, b) in &writes {
+                f.write_all_at(b, *off)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("gap write join: {e}")))??;
+    }
+    Ok((cloned_pages, fetched_pages))
+}
+
 /// Timing + hit/miss breakdown of a [`reconstruct`], for measurement.
 #[derive(Debug)]
 pub struct ReconStats {

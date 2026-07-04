@@ -87,11 +87,18 @@ struct FrameList {
     frames: Vec<String>,
 }
 
-async fn list_frames(State(state): State<Arc<AppState>>) -> Json<FrameList> {
-    let ids = state.frames.ids().await;
-    Json(FrameList {
+async fn list_frames(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrameList>, (StatusCode, String)> {
+    let ids = state.frames.ids().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("listing central store: {e}"),
+        )
+    })?;
+    Ok(Json(FrameList {
         frames: ids.into_iter().map(|i| i.as_str().to_owned()).collect(),
-    })
+    }))
 }
 
 async fn build_handler(
@@ -352,8 +359,19 @@ async fn step_handler_sse(
     Json(eval): Json<EvalRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let frame_id = FrameId::from(id);
-    let Some(parent) = state.frames.get(&frame_id).await else {
-        return Err((StatusCode::NOT_FOUND, format!("no such frame: {frame_id}")));
+    // Local hit or cold fetch from the central store (frames survive host
+    // restarts; any machine can serve any committed frame id).
+    let parent = match state.frames.get_or_fetch(&frame_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return Err((StatusCode::NOT_FOUND, format!("no such frame: {frame_id}")));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("fetching {frame_id} from central store: {e}"),
+            ));
+        }
     };
 
     let (event_tx, mut event_rx) = mpsc::channel::<StepEvent>(64);
@@ -451,12 +469,22 @@ async fn step_handler_ws(
 ) -> Response {
     tracing::info!(frame = %id, "ws_step: handler invoked");
     let frame_id = FrameId::from(id);
-    let Some(parent) = state.frames.get(&frame_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("no such frame: {frame_id}"),
-        )
-            .into_response();
+    let parent = match state.frames.get_or_fetch(&frame_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no such frame: {frame_id}"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("fetching {frame_id} from central store: {e}"),
+            )
+                .into_response();
+        }
     };
     let installation = Arc::clone(&state.installation);
     let frames = Arc::clone(&state.frames);
@@ -578,44 +606,50 @@ async fn run_step_ws_session(
         ws_sink
     });
 
-    // Inbound: client frames → input_tx. Never blocks behind an outbound
-    // send, so Kill/Close always get read promptly.
-    loop {
-        match ws_stream.next().await {
-            Some(Ok(Message::Binary(b))) => {
-                if input_tx.send(StepInput::Stdin(b.to_vec())).await.is_err() {
+    // Inbound: client frames → input_tx, in its OWN task. The session's main
+    // path must never be parked on the client's next frame: for an input-less
+    // command (a plain `ls`) there IS no next frame, and when this loop ran
+    // inline here the finished result sat waiting behind `ws_stream.next()`
+    // forever — the client stared at "snapshotting…" until it gave up. The
+    // step finishing (below) is what ends the session; the client talking
+    // again is optional.
+    let inbound = tokio::spawn(async move {
+        let mut cancel_tx = cancel_tx;
+        loop {
+            match ws_stream.next().await {
+                Some(Ok(Message::Binary(b))) => {
+                    if input_tx.send(StepInput::Stdin(b.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Text(t))) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(t.as_str()).unwrap_or(serde_json::Value::Null);
+                    if v.get("kill").and_then(|b| b.as_bool()) == Some(true) {
+                        let _ = input_tx.send(StepInput::Kill).await;
+                    } else if v.get("stdin_close").and_then(|b| b.as_bool()) == Some(true) {
+                        let _ = input_tx.send(StepInput::StdinClose).await;
+                    }
+                    // Other text frames are ignored as forward-compat.
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    // try_send: pongs are advisory; dropping one under load is
+                    // fine, blocking the inbound loop behind the sink is not.
+                    let _ = pong_tx.try_send(p.to_vec());
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                    if let Some(tx) = cancel_tx.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
             }
-            Some(Ok(Message::Text(t))) => {
-                let v: serde_json::Value =
-                    serde_json::from_str(t.as_str()).unwrap_or(serde_json::Value::Null);
-                if v.get("kill").and_then(|b| b.as_bool()) == Some(true) {
-                    let _ = input_tx.send(StepInput::Kill).await;
-                } else if v.get("stdin_close").and_then(|b| b.as_bool()) == Some(true) {
-                    let _ = input_tx.send(StepInput::StdinClose).await;
-                }
-                // Other text frames are ignored as forward-compat.
-            }
-            Some(Ok(Message::Ping(p))) => {
-                // try_send: pongs are advisory; dropping one under load is
-                // fine, blocking the inbound loop behind the sink is not.
-                let _ = pong_tx.try_send(p.to_vec());
-            }
-            Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                if let Some(tx) = cancel_tx.take() {
-                    let _ = tx.send(());
-                }
-                break;
-            }
         }
-    }
-
-    // Drop input_tx so any pending input branch in run_eval observes EOF
-    // promptly; drop pong_tx so the outbound task's pong branch goes dormant.
-    drop(input_tx);
-    drop(pong_tx);
+        // Drop input_tx so any pending input branch in run_eval observes EOF
+        // promptly (pong_tx dies with the task).
+        drop(input_tx);
+    });
 
     // Wait for step_frame to finish (hard_kill has run either way). The
     // outbound task ends right after: step_frame's event senders are gone,
@@ -633,6 +667,9 @@ async fn run_step_ws_session(
         .send(control_frame(&StepControl::Result(body)))
         .await;
     let _ = ws_sink.send(Message::Close(None)).await;
+    // The session is over; don't leave the reader parked on a client that
+    // never sends another frame.
+    inbound.abort();
 }
 
 /// Serialize a [`StepControl`] into a WS text frame.

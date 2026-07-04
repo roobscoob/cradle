@@ -1231,7 +1231,7 @@ impl Drop for FrameDirGuard {
 
 /// Fresh-build ingest: hash every page of the full mem image into a tree,
 /// storing only inner nodes — the image itself is the page-byte store.
-async fn ingest_full(cas: &store::LocalCas, mem_path: &Path) -> std::io::Result<MemTree> {
+async fn ingest_full<C: Cas>(cas: &C, mem_path: &Path) -> std::io::Result<MemTree> {
     let t0 = std::time::Instant::now();
     let tree = store::memtree::build_nodes_from_path(cas, mem_path).await?;
     let build_ms = t0.elapsed().as_millis() as u64;
@@ -1256,8 +1256,8 @@ struct CaptureSpans {
     dirty_pages: u64,
 }
 
-async fn diff_ingest(
-    cas: &store::LocalCas,
+async fn diff_ingest<C: Cas>(
+    cas: &C,
     parent: &Frame,
     diff_mem_path: &Path,
     child_mem: &Path,
@@ -1366,12 +1366,12 @@ async fn diff_ingest(
 /// `Cas` overlay for the reconstruct measurement: dirty pages resolve from
 /// memory (they're no longer stored as blobs), everything else (tree nodes)
 /// falls through to the scratch CAS.
-struct DirtyOverlay<'a> {
-    inner: &'a store::LocalCas,
+struct DirtyOverlay<'a, C> {
+    inner: &'a C,
     pages: std::collections::HashMap<Hash, Vec<u8>>,
 }
 
-impl Cas for DirtyOverlay<'_> {
+impl<C: Cas> Cas for DirtyOverlay<'_, C> {
     async fn put(&self, bytes: &[u8]) -> std::io::Result<Hash> {
         self.inner.put(bytes).await
     }

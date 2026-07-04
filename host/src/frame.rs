@@ -33,7 +33,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use store::{ContentStore, FrameRecord, Hash, LocalCas, MemTree, memtree};
+use store::{ContentStore, FrameRecord, Hash, MemTree, NodePack, memtree};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use ulid::Ulid;
@@ -111,9 +111,10 @@ impl Frame {
 pub struct FrameStore {
     root: TempDir,
     frames: RwLock<HashMap<FrameId, Arc<Frame>>>,
-    /// Scratch CAS holding merkle *inner nodes* only — page bytes live in the
-    /// frames' mem images and are located by content via the tree.
-    cas: LocalCas,
+    /// Scratch store for merkle *inner nodes* only (append-only log +
+    /// in-RAM index) — page bytes live in the frames' mem images and are
+    /// located by content via the tree.
+    cas: NodePack,
     /// The durable tier. Every returned frame id has already been committed
     /// here; every unknown id is looked up here.
     central: Arc<dyn ContentStore>,
@@ -130,7 +131,7 @@ impl FrameStore {
         // always have the full guest serial transcript on disk regardless
         // of SSE consumers or tracing filters.
         std::fs::create_dir_all(root.path().join("serial"))?;
-        let cas = LocalCas::new(root.path().join("cas"))?;
+        let cas = NodePack::create(root.path().join("nodes"))?;
         tracing::info!("frame store root: {}", root.path().display());
         Ok(Arc::new(Self {
             root,
@@ -145,7 +146,7 @@ impl FrameStore {
         self.root.path()
     }
 
-    pub fn cas(&self) -> &LocalCas {
+    pub fn cas(&self) -> &NodePack {
         &self.cas
     }
 

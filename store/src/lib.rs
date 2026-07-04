@@ -19,7 +19,9 @@
 pub mod cas;
 pub mod central;
 pub mod memtree;
+pub mod nodepack;
 
 pub use cas::{Cas, Hash, LocalCas};
 pub use central::{BlobSrc, ContentStore, DirStore, FrameRecord};
 pub use memtree::MemTree;
+pub use nodepack::NodePack;

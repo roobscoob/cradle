@@ -352,7 +352,80 @@ The host crate is Linux-only — build/test it on Linux.
 ---
 
 ## 10. One-line status
-Local foundation (P1–P3) done and validated: sub-second steps, ~340 ms snapshots, a
-measured ~6.7 MiB/GiB warm reconstruction (`recon_ok=true`). Next is **P4**: a thin
-reflink-image store daemon serving a want/have patch protocol — starting with the
-exact 2-RT model on the LAN, ancestor ref kept, Bloom deferred.
+Two-tier store landed (2026-07-04): local scratch (btrfs loopback on the dev box's
+SSD pool) + central `ContentStore` (pack-file `DirStore` on tank). Frame ids commit
+before they're returned, frames survive host restarts (cold fetch rematerializes
+from central), cross-lineage dedup measurable in shrinking `uploaded_blobs`. Warm
+step ~1.7 s end-to-end; §11 is the plan to ~100 ms. The P4 daemon remains next for
+fleet — it slots behind the existing `ContentStore` trait.
+
+---
+
+## 11. Central-store semantics + step-latency plan (2026-07-04)
+
+Decisions from the two-tier build-out, recorded so the daemon inherits a spec.
+
+### The commit contract (absolute)
+`ContentStore::commit` returning MEANS the frame is durable. Not applied, not
+weak — a frame id is only released after commit returns, and any machine may
+cash it at any later time. No ack tiers in prod, ever. How *cheaply* the
+receiver honors this is its own business: NVMe journal, group commit across
+workers (one fsync covers every commit in the same few ms — only exists once
+there's a single choke point), replication. Worker-visible commit time trends
+to `1 RTT + miss_bytes/bandwidth + receiver's journal fsync`.
+
+Corollary: `commit` must be blind-retryable — networks lose acks after the
+work succeeded; content addressing + record id make replay a no-op.
+
+### DirStore (dev backing) knowingly breaks the contract
+No fsync anywhere; durability rides the next ZFS txg (~5 s). Machine crash
+(power/kernel, NOT process death) revokes the newest ~5 s of acked frames.
+Loss is suffix-shaped — ZFS commits atomic prefixes of the per-dataset op
+stream, so a lineage rolls back to an earlier tip, never gets holes, and a
+visible record never references missing bytes. Accepted for dev: recovery is
+"re-run the last command". Structural safety is a hard ZFS coupling — on a
+reordering fs (ext4/xfs) even the no-fsync structure would be unsafe.
+
+### Measured commit anatomy (kokuzo, 1 GiB guest, `ls` step, ~13 MB dirty)
+want/have tree diff ~100–200 ms (file-per-node reads — dies with node packs)
+→ assemble ~50 ms → pack write ~50–100 ms buffered → terminal fsync on raw
+tank ~500–900 ms (~9 MB/s sync). The fsync line is what the contract costs on
+spinning rust; with it deleted (above), commit ≈ walk + assemble + buffered
+write. History: 5 barriers → 1 (ZFS ordering) → 0 (dev exemption).
+
+### Plan to ~100 ms snapshotting (phases; fleet work stays deferred)
+Measured step anatomy: restore 5 ms · guest ~260 ms · fc diff ~150 ms ·
+ingest ~280 ms · commit (no fsync) ~200–350 ms · plumbing ~50 ms.
+1. **Code (in flight):** sub-span timing in the capture path; node packs
+   (append-only log + in-RAM `hash→(seg,off)` index, verify-on-read; kills
+   ~400 file-create/rename ceremonies per step); ext4 jail-output scratch
+   (fc's sparse 4 KiB writes were paying btrfs CoW extent churn); commit
+   pages from memory + child-image patch moved off the critical path behind
+   a per-frame ready gate. Target: fc 40–80 ms, update 20–40 ms, walk ~10 ms
+   → snapshotting ~120–190 ms.
+2. **(dissolved by the dev exemption — was: make the fsync cheap via SLOG.**
+   sdo can still be split L2ARC/SLOG later as a NAS improvement; ~16–32 GB
+   is the right SLOG size, not 2 TB.)
+3. **Dirty-set reduction:** free-page reporting via the balloon (see §8.7 —
+   freed-page semantics must fold into the change set). ~13 MB dirty for
+   `ls` is mostly kernel bookkeeping; 2–5× shrink multiplies through fc
+   write, hashing, upload, and the fleet's 1 Gbps math. This carries
+   ~150 ms → ≤100 ms.
+
+### Blade memory rule (fleet worker profile: ~32 GB RAM, 0.5–2 TB SSD)
+Host RAM holds O(index); storage holds O(history); the page cache adapts —
+it's evictable under guest pressure, anonymous host memory isn't. Rejected on
+this rule: in-RAM node store, tmpfs snapshot outputs. Node-pack index ~80 B/
+node; coarse (L1-subtree) global content index + fine per-lineage lazy index
+is the persistent-cache shape (leaf-level global index is ~400 MB at 20
+images — over budget; coarse catches runs (zeros, kernel text), lineage-fine
+keeps warm fetches O(dirty), scattered cross-lineage singles degrade to
+batched 4 KiB fetches).
+
+### Local-tier persistence (agreed direction, not yet built)
+Frames/*images* are already the persistent page store (reflink = zero page &
+kernel text stored once, shared everywhere) — persistence = stop wiping the
+tier + startup reconciliation + eviction (lineage-LRU; btrfs frees extents
+when the last referrer dies). Node packs persist with verify-on-read: a
+CAS-backed cache needs no crash consistency — torn entry = miss = refetch.
+Deferred with eviction/affinity/prefetch until single-machine is done.

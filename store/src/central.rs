@@ -14,19 +14,22 @@
 //! write and one fsync per *commit*. The real network daemon (work.md §7)
 //! slots in behind the same trait later.
 //!
-//! Crash safety in [`DirStore::commit`] leans on a **hard ZFS coupling**:
-//! ZFS is ordering-preserving per dataset (txgs commit atomic *prefixes* of
-//! the operation stream; ZIL replay is in-order), so "index visible ⇒ pack
-//! durable" and "record visible ⇒ everything durable" hold with zero
-//! intermediate barriers — a crash leaves a clean prefix (orphan pack, or
-//! pack+index with no record: harmless, reclaimable garbage). The only thing
-//! ordering doesn't give is the durability promise itself, so commit ends
-//! with exactly ONE fsync: `zil_commit` on the last-published file drags the
-//! whole preceding intent chain (pack bytes included) into the log.
+//! THE CONTRACT: [`ContentStore::commit`] returning MEANS the frame is
+//! durable — not applied, not probably, not eventually. A frame id is only
+//! released after commit returns, so any machine may cash it at any later
+//! time. The production ContentStore (the store daemon) honors this
+//! absolutely; how cheaply is the receiver's business (journal device,
+//! group commit), never the caller's.
 //!
-//! On a freely-reordering filesystem (ext4/XFS) this scheme is UNSAFE — a
-//! record's rename could survive a crash that its pack didn't. Don't point a
-//! DirStore at one; the network daemon owns its own durability discipline.
+//! [`DirStore`] — the dev backing — DELIBERATELY VIOLATES the contract:
+//! see its type-level doc. Structural safety still leans on a **hard ZFS
+//! coupling**: ZFS is ordering-preserving per dataset (txgs commit atomic
+//! *prefixes* of the operation stream), so "index visible ⇒ pack durable"
+//! and "record visible ⇒ everything durable" hold with zero barriers, and a
+//! crash leaves a clean prefix — orphan packs or blobs-without-record are
+//! harmless reclaimable garbage; a visible record never references missing
+//! bytes. On a freely-reordering filesystem (ext4/XFS) even that is UNSAFE.
+//! Full rationale + the step-latency plan: work.md §11.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -83,9 +86,14 @@ pub trait ContentStore: Send + Sync {
     /// Single-blob presence check — the holder side of a tree diff walk.
     fn has<'a>(&'a self, hash: &'a Hash) -> BoxFut<'a, bool>;
 
-    /// Durably store `blobs`, then (if given) the frame record. Returns only
-    /// once everything is safe: this call is the durability event behind a
-    /// frame id. Already-present blobs are skipped (idempotent).
+    /// Store `blobs`, then (if given) the frame record. THE CONTRACT: when
+    /// this returns, the frame is durable — this call is the durability
+    /// event behind a frame id, and there is no weaker tier of ack.
+    /// Already-present blobs are skipped, and the whole call is safe to
+    /// blind-retry (content addressing makes replay a no-op) — networks
+    /// lose acks after the work succeeded.
+    ///
+    /// (DirStore, the dev backing, knowingly breaks this — see its doc.)
     fn commit<'a>(
         &'a self,
         blobs: Vec<(Hash, BlobSrc)>,
@@ -113,6 +121,14 @@ struct BlobLoc {
 
 /// Filesystem-backed [`ContentStore`]: `<root>/packs/*.pack` (+ `.idx`) and
 /// `<root>/frames/<id>.json`.
+///
+/// ⚠ DEV BACKING — DELIBERATELY VIOLATES THE DURABILITY CONTRACT. Nothing
+/// here fsyncs: commit returns once the writes are in the page cache, and
+/// durability arrives when ZFS's next txg commits (~5s). A machine crash
+/// (power loss, kernel panic — NOT process death) revokes the newest ~5s of
+/// acked frames. The loss is suffix-shaped (ZFS prefix ordering): a lineage
+/// rolls back to an earlier tip, never gets holes. Accepted for the dev
+/// loop; the production ContentStore honors commit ⇒ durable absolutely.
 ///
 /// Multi-writer safe by append-only construction: pack names are unique per
 /// (startup, pid, seq), records land by atomic rename. A process only *sees*
@@ -246,12 +262,6 @@ fn place(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// The one barrier per commit: fsync the last-published file, which on ZFS
-/// commits every operation that preceded it in the dataset's intent stream.
-fn terminal_fsync(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
 impl ContentStore for DirStore {
     fn missing<'a>(&'a self, hashes: &'a [Hash]) -> BoxFut<'a, Vec<Hash>> {
         Box::pin(async move {
@@ -286,15 +296,11 @@ impl ContentStore for DirStore {
                     .collect()
             };
 
-            // Path of the last file placed, target of the terminal fsync.
-            let mut last_placed: Option<PathBuf> = None;
-
             if !todo.is_empty() {
                 let seq = self.seq.fetch_add(1, Ordering::Relaxed);
                 let name = format!("{:013}-{}-{seq}", self.opened_ms, std::process::id());
                 let pack_path = self.packs_dir.join(format!("{name}.pack"));
                 let idx_path = self.packs_dir.join(format!("{name}.idx"));
-                last_placed = Some(idx_path.clone());
                 let pack_path_cl = pack_path.clone();
 
                 // The pack build is sequential large I/O — blocking pool.
@@ -354,21 +360,14 @@ impl ContentStore for DirStore {
             if let Some(rec) = record {
                 let path = self.frame_path(&rec.id);
                 let bytes = serde_json::to_vec_pretty(rec)?;
-                let p = path.clone();
-                tokio::task::spawn_blocking(move || place(&p, &bytes))
+                tokio::task::spawn_blocking(move || place(&path, &bytes))
                     .await
                     .map_err(|e| io::Error::other(format!("record join: {e}")))??;
-                last_placed = Some(path);
             }
 
-            // The one barrier of the whole commit (see the module doc): on
-            // ZFS this zil_commit makes every preceding operation — pack
-            // bytes, index, record, all the renames — durable, in order.
-            if let Some(p) = last_placed {
-                tokio::task::spawn_blocking(move || terminal_fsync(&p))
-                    .await
-                    .map_err(|e| io::Error::other(format!("fsync join: {e}")))??;
-            }
+            // NO fsync — the deliberate contract violation (see type doc).
+            // Durability rides the next ZFS txg (~5s); ordering alone keeps
+            // every crash-visible state structurally sound.
             Ok(())
         })
     }

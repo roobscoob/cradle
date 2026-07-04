@@ -557,9 +557,11 @@ async fn run_step_after_prepare(
     let listener = create_agent_listener(jail_path)?;
 
     let _ = events.send(StepEvent::Phase("restoring")).await;
+    let t_restore = std::time::Instant::now();
     vm.start(VM_START_TIMEOUT)
         .await
         .map_err(|e| OpError::vmm(format!("Vm::start: {e:?}")))?;
+    let restore_ms = t_restore.elapsed().as_millis() as u64;
 
     let _serial_tasks = spawn_serial_taps(vm, serial_log_path, None);
 
@@ -568,7 +570,13 @@ async fn run_step_after_prepare(
     // uncontested CPU to finish its post-restore vsock reset, then the
     // agent dials and we accept.
     let _ = events.send(StepEvent::Phase("attaching")).await;
+    let t_attach = std::time::Instant::now();
     let mut link = accept_agent(&listener, AGENT_AWAKE_TIMEOUT).await?;
+    tracing::info!(
+        restore_ms,
+        attach_ms = t_attach.elapsed().as_millis() as u64,
+        "restore spans"
+    );
 
     // `evaluating` is exactly send-eval + drain responses to ProcessExit.
     let _ = events.send(StepEvent::Phase("evaluating")).await;
